@@ -86,7 +86,7 @@ async function fetchFromTzevaadom(): Promise<number> {
           raw_data: alert,
         }, {
           onConflict: 'city_name,alert_datetime',
-          ignoreDuplicates: true,
+          ignoreDuplicates: false,
         });
 
         if (error) {
@@ -178,7 +178,7 @@ async function fetchFromOrefHistory(): Promise<number> {
       const batch = rows.slice(i, i + BATCH_SIZE);
       const { error } = await db.from('alerts').upsert(batch, {
         onConflict: 'city_name,alert_datetime',
-        ignoreDuplicates: true,
+        ignoreDuplicates: false,
       });
       if (error) {
         console.error(`Oref batch error:`, error.message);
