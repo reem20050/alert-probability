@@ -34,14 +34,56 @@ function getIsraelHour(date: Date): number {
 }
 
 /**
+ * Deduplicate alerts: group alerts within a 2-minute window into single "events".
+ * When a rocket salvo hits a region, multiple cities get alerts within seconds.
+ * We treat these as ONE event, not 15+ separate alerts.
+ *
+ * Returns an array of "event" objects, each with:
+ * - alert_datetime: the earliest alert in the group (event start)
+ * - city_count: how many cities were alerted in this event
+ */
+function deduplicateAlerts(alerts: any[]): { alert_datetime: string; city_count: number }[] {
+  if (alerts.length === 0) return [];
+
+  // Sort by datetime ascending
+  const sorted = [...alerts].sort(
+    (a, b) => new Date(a.alert_datetime).getTime() - new Date(b.alert_datetime).getTime()
+  );
+
+  const events: { alert_datetime: string; city_count: number }[] = [];
+  let eventStart = new Date(sorted[0].alert_datetime).getTime();
+  let eventDatetime = sorted[0].alert_datetime;
+  let cityCount = 1;
+
+  for (let i = 1; i < sorted.length; i++) {
+    const ts = new Date(sorted[i].alert_datetime).getTime();
+    if (ts - eventStart <= 2 * 60 * 1000) {
+      // Within 2-minute window — same event
+      cityCount++;
+    } else {
+      // New event
+      events.push({ alert_datetime: eventDatetime, city_count: cityCount });
+      eventStart = ts;
+      eventDatetime = sorted[i].alert_datetime;
+      cityCount = 1;
+    }
+  }
+  // Push last event
+  events.push({ alert_datetime: eventDatetime, city_count: cityCount });
+
+  return events;
+}
+
+/**
  * Factor 1: Recent Activity (0-100)
  * Multi-timescale scoring — the more recent the alerts, the higher the score.
  * Uses tiered windows with exponential decay within each tier.
+ * Now operates on deduplicated events (not raw alerts).
  */
-function scoreRecentActivity(alerts: any[], nowMs: number): number {
-  if (alerts.length === 0) return 0;
+function scoreRecentActivity(events: { alert_datetime: string; city_count: number }[], nowMs: number): number {
+  if (events.length === 0) return 0;
 
-  const mostRecentMs = Math.max(...alerts.map((a: any) => new Date(a.alert_datetime).getTime()));
+  const mostRecentMs = Math.max(...events.map(e => new Date(e.alert_datetime).getTime()));
   const ageMinutes = (nowMs - mostRecentMs) / (60 * 1000);
 
   // Tiered scoring based on recency
@@ -57,28 +99,30 @@ function scoreRecentActivity(alerts: any[], nowMs: number): number {
 
 /**
  * Factor 2: Attack Intensity (0-100)
- * How many alerts happened in recent time windows.
- * A burst of 50 alerts in an hour matters more than 50 spread over a week.
+ * How many alert EVENTS happened in recent time windows.
+ * A burst of 5 salvos in an hour matters more than 5 spread over a week.
+ * Now operates on deduplicated events (not raw alerts).
  */
-function scoreIntensity(alerts: any[], nowMs: number): number {
-  if (alerts.length === 0) return 0;
+function scoreIntensity(events: { alert_datetime: string; city_count: number }[], nowMs: number): number {
+  if (events.length === 0) return 0;
 
-  // Count alerts in different windows
+  // Count events in different windows
   let last1h = 0, last6h = 0, last24h = 0, last7d = 0;
-  for (const a of alerts) {
-    const ageMs = nowMs - new Date(a.alert_datetime).getTime();
+  for (const e of events) {
+    const ageMs = nowMs - new Date(e.alert_datetime).getTime();
     if (ageMs < 1 * 60 * 60 * 1000) last1h++;
     if (ageMs < 6 * 60 * 60 * 1000) last6h++;
     if (ageMs < 24 * 60 * 60 * 1000) last24h++;
     if (ageMs < 7 * 24 * 60 * 60 * 1000) last7d++;
   }
 
-  // Alerts per hour in each window, normalized to 0-100
+  // Events per hour in each window, normalized to 0-100
+  // Thresholds adjusted: events are fewer than raw alerts
   const rateScores = [
-    Math.min(100, last1h * 8),              // 12+ alerts/hour = 100
-    Math.min(100, (last6h / 6) * 12),       // ~8 alerts/hour avg over 6h = 100
-    Math.min(100, (last24h / 24) * 15),     // ~7 alerts/hour avg over 24h = 100
-    Math.min(100, (last7d / 168) * 25),     // ~4 alerts/hour avg over 7d = 100
+    Math.min(100, last1h * 20),             // 5+ events/hour = 100
+    Math.min(100, (last6h / 6) * 25),       // ~4 events/hour avg over 6h = 100
+    Math.min(100, (last24h / 24) * 35),     // ~3 events/hour avg over 24h = 100
+    Math.min(100, (last7d / 168) * 60),     // ~2 events/hour avg over 7d = 100
   ];
 
   // Take the max — a burst in any window counts
@@ -89,24 +133,25 @@ function scoreIntensity(alerts: any[], nowMs: number): number {
  * Factor 3: Time-of-Day Pattern (0-100)
  * Do historical attacks tend to happen at this time of day?
  * Looks at ±2 hour window from current Israel time.
+ * Now operates on deduplicated events (not raw alerts).
  */
-function scoreTimePattern(alerts: any[], currentIsraelHour: number): number {
-  if (alerts.length === 0) return 0;
+function scoreTimePattern(events: { alert_datetime: string; city_count: number }[], currentIsraelHour: number): number {
+  if (events.length === 0) return 0;
 
-  // Count alerts in ±2h window vs total
+  // Count events in ±2h window vs total
   const windowHours = new Set<number>();
   for (let h = currentIsraelHour - 2; h <= currentIsraelHour + 2; h++) {
     windowHours.add(((h % 24) + 24) % 24);
   }
 
   let inWindow = 0;
-  for (const a of alerts) {
-    if (windowHours.has(getIsraelHour(new Date(a.alert_datetime)))) inWindow++;
+  for (const e of events) {
+    if (windowHours.has(getIsraelHour(new Date(e.alert_datetime)))) inWindow++;
   }
 
-  // What fraction of alerts happen in this time window?
+  // What fraction of events happen in this time window?
   // 5/24 = ~21% would be expected by chance
-  const fraction = inWindow / alerts.length;
+  const fraction = inWindow / events.length;
   const expectedFraction = 5 / 24; // 5 hours out of 24
 
   if (fraction <= expectedFraction) return Math.round(fraction / expectedFraction * 30); // Below average: 0-30
@@ -118,16 +163,17 @@ function scoreTimePattern(alerts: any[], currentIsraelHour: number): number {
  * Factor 4: Trend / Escalation (0-100)
  * Is the attack rate increasing or decreasing?
  * Compares last 24h to previous 48h (the 24-72h window).
+ * Now operates on deduplicated events (not raw alerts).
  */
-function scoreTrend(alerts: any[], nowMs: number): { score: number; direction: string } {
-  const last24h = alerts.filter((a: any) => nowMs - new Date(a.alert_datetime).getTime() < 24 * 60 * 60 * 1000);
-  const prev48h = alerts.filter((a: any) => {
-    const age = nowMs - new Date(a.alert_datetime).getTime();
+function scoreTrend(events: { alert_datetime: string; city_count: number }[], nowMs: number): { score: number; direction: string } {
+  const last24h = events.filter(e => nowMs - new Date(e.alert_datetime).getTime() < 24 * 60 * 60 * 1000);
+  const prev48h = events.filter(e => {
+    const age = nowMs - new Date(e.alert_datetime).getTime();
     return age >= 24 * 60 * 60 * 1000 && age < 72 * 60 * 60 * 1000;
   });
 
-  const recentRate = last24h.length / 1; // alerts per day (last 1 day)
-  const olderRate = prev48h.length / 2;  // alerts per day (2-day window)
+  const recentRate = last24h.length / 1; // events per day (last 1 day)
+  const olderRate = prev48h.length / 2;  // events per day (2-day window)
 
   if (olderRate === 0 && recentRate === 0) return { score: 0, direction: 'stable' };
   if (olderRate === 0 && recentRate > 0) return { score: 85, direction: 'rising' }; // New escalation
@@ -147,10 +193,11 @@ function scoreTrend(alerts: any[], nowMs: number): { score: number; direction: s
  * Factor 5: Regional Spillover (0-100)
  * Are neighboring regions experiencing alerts?
  * If your neighbors are getting hit, you're more likely to be next.
+ * Now operates on deduplicated events (not raw alerts).
  */
 function scoreRegionalSpill(
   regionSlug: string,
-  allAlertsByRegion: Record<string, any[]>,
+  allEventsByRegion: Record<string, { alert_datetime: string; city_count: number }[]>,
   nowMs: number
 ): number {
   const neighbors = NEIGHBORS[regionSlug] ?? [];
@@ -158,15 +205,15 @@ function scoreRegionalSpill(
 
   let neighborScore = 0;
   for (const n of neighbors) {
-    const nAlerts = allAlertsByRegion[n] ?? [];
-    // Count alerts in last 6h from this neighbor
-    const recentCount = nAlerts.filter(
-      (a: any) => nowMs - new Date(a.alert_datetime).getTime() < 6 * 60 * 60 * 1000
+    const nEvents = allEventsByRegion[n] ?? [];
+    // Count events in last 6h from this neighbor
+    const recentCount = nEvents.filter(
+      e => nowMs - new Date(e.alert_datetime).getTime() < 6 * 60 * 60 * 1000
     ).length;
 
     if (recentCount > 0) {
       // Each active neighbor contributes, diminishing returns
-      neighborScore += Math.min(40, recentCount * 5);
+      neighborScore += Math.min(40, recentCount * 8);
     }
   }
 
@@ -203,18 +250,25 @@ async function calculateAll() {
     }
   }
 
+  // Deduplicate: group alerts within 2-min windows into single "events" per region
+  const eventsByRegion: Record<string, { alert_datetime: string; city_count: number }[]> = {};
+  for (const r of REGIONS) {
+    eventsByRegion[r] = deduplicateAlerts(alertsByRegion[r]);
+  }
+
   const currentIsraelHour = getIsraelHour(now);
   const snapshots = [];
 
   for (const regionSlug of REGIONS) {
-    const regionAlerts = alertsByRegion[regionSlug];
+    const regionAlerts = alertsByRegion[regionSlug];  // raw alerts (for stats & active check)
+    const regionEvents = eventsByRegion[regionSlug];  // deduplicated events (for scoring)
 
-    // Calculate each factor
-    const recentActivity = scoreRecentActivity(regionAlerts, nowMs);
-    const intensity = scoreIntensity(regionAlerts, nowMs);
-    const timePattern = scoreTimePattern(regionAlerts, currentIsraelHour);
-    const { score: trendScore, direction: trendDirection } = scoreTrend(regionAlerts, nowMs);
-    const regionalSpill = scoreRegionalSpill(regionSlug, alertsByRegion, nowMs);
+    // Calculate each factor using deduplicated events
+    const recentActivity = scoreRecentActivity(regionEvents, nowMs);
+    const intensity = scoreIntensity(regionEvents, nowMs);
+    const timePattern = scoreTimePattern(regionEvents, currentIsraelHour);
+    const { score: trendScore, direction: trendDirection } = scoreTrend(regionEvents, nowMs);
+    const regionalSpill = scoreRegionalSpill(regionSlug, eventsByRegion, nowMs);
 
     // Weighted combination
     const rawScore =
@@ -248,7 +302,7 @@ async function calculateAll() {
       has_active_alert: hasActiveAlert,
     });
 
-    console.log(`  ${regionSlug}: ${finalScore}% [recent=${Math.round(recentActivity)} intensity=${Math.round(intensity)} time=${Math.round(timePattern)} trend=${Math.round(trendScore)}(${trendDirection}) spill=${Math.round(regionalSpill)}] 24h:${alertsLast24h.length} 7d:${alertsLast7d.length}`);
+    console.log(`  ${regionSlug}: ${finalScore}% [recent=${Math.round(recentActivity)} intensity=${Math.round(intensity)} time=${Math.round(timePattern)} trend=${Math.round(trendScore)}(${trendDirection}) spill=${Math.round(regionalSpill)}] alerts:${regionAlerts.length}→events:${regionEvents.length} 24h:${alertsLast24h.length} 7d:${alertsLast7d.length}`);
   }
 
   // Insert all snapshots
