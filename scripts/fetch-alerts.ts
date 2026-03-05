@@ -105,13 +105,13 @@ async function fetchFromTzevaadom(): Promise<number> {
   }
 }
 
-/** Step 2: Backfill from oref history API (last 24h) */
+/** Step 2: Backfill from oref history API (last 30 days) */
 async function fetchFromOrefHistory(): Promise<number> {
-  console.log('--- Oref history backfill (24h) ---');
+  console.log('--- Oref history backfill (30 days) ---');
   try {
     const now = new Date();
-    const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-    const fromDate = formatDateForOref(oneDayAgo);
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const fromDate = formatDateForOref(thirtyDaysAgo);
     const toDate = formatDateForOref(now);
 
     const url = `${OREF_HISTORY_URL}?lang=he&fromDate=${fromDate}&toDate=${toDate}&mode=0`;

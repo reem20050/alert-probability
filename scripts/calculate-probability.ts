@@ -5,25 +5,186 @@ const REGIONS = [
   'galilee', 'jerusalem', 'gaza-envelope', 'judea-samaria', 'eilat-arava'
 ];
 
-const WEIGHTS = { frequency: 0.35, recency: 0.30, timePattern: 0.20, trend: 0.15 };
-const RECENCY_HALF_LIFE_MS = 6 * 60 * 60 * 1000;
+// Regional adjacency map for spillover scoring
+const NEIGHBORS: Record<string, string[]> = {
+  'gush-dan':       ['sharon', 'shfela', 'jerusalem'],
+  'sharon':         ['gush-dan', 'haifa', 'judea-samaria'],
+  'shfela':         ['gush-dan', 'jerusalem', 'gaza-envelope', 'negev'],
+  'negev':          ['shfela', 'gaza-envelope', 'eilat-arava'],
+  'haifa':          ['sharon', 'galilee'],
+  'galilee':        ['haifa', 'judea-samaria'],
+  'jerusalem':      ['gush-dan', 'shfela', 'judea-samaria'],
+  'gaza-envelope':  ['shfela', 'negev'],
+  'judea-samaria':  ['sharon', 'galilee', 'jerusalem'],
+  'eilat-arava':    ['negev'],
+};
+
+// Weights for each factor
+const W = {
+  recentActivity: 0.30,   // How recently were there alerts?
+  intensity:      0.25,   // How intense is the current attack?
+  timePattern:    0.15,   // Do attacks happen at this time of day?
+  trend:          0.15,   // Is the situation escalating?
+  regionalSpill:  0.15,   // Are neighboring regions being attacked?
+};
 
 /** Get hour (0-23) in Israel timezone */
 function getIsraelHour(date: Date): number {
   return parseInt(date.toLocaleString('en-US', { timeZone: 'Asia/Jerusalem', hour: 'numeric', hour12: false }));
 }
 
+/**
+ * Factor 1: Recent Activity (0-100)
+ * Multi-timescale scoring — the more recent the alerts, the higher the score.
+ * Uses tiered windows with exponential decay within each tier.
+ */
+function scoreRecentActivity(alerts: any[], nowMs: number): number {
+  if (alerts.length === 0) return 0;
+
+  const mostRecentMs = Math.max(...alerts.map((a: any) => new Date(a.alert_datetime).getTime()));
+  const ageMinutes = (nowMs - mostRecentMs) / (60 * 1000);
+
+  // Tiered scoring based on recency
+  if (ageMinutes <= 5)   return 98;  // Active right now
+  if (ageMinutes <= 15)  return 92;  // Just happened
+  if (ageMinutes <= 60)  return 75 + (1 - ageMinutes / 60) * 15;  // Last hour: 75-90
+  if (ageMinutes <= 360) return 45 + (1 - ageMinutes / 360) * 30;  // Last 6h: 45-75
+  if (ageMinutes <= 1440) return 20 + (1 - ageMinutes / 1440) * 25; // Last 24h: 20-45
+  if (ageMinutes <= 4320) return 8 + (1 - ageMinutes / 4320) * 12;  // Last 3d: 8-20
+  if (ageMinutes <= 10080) return 2 + (1 - ageMinutes / 10080) * 6; // Last 7d: 2-8
+  return Math.max(0, 2 * Math.exp(-ageMinutes / 20160)); // Beyond 7d: exponential decay
+}
+
+/**
+ * Factor 2: Attack Intensity (0-100)
+ * How many alerts happened in recent time windows.
+ * A burst of 50 alerts in an hour matters more than 50 spread over a week.
+ */
+function scoreIntensity(alerts: any[], nowMs: number): number {
+  if (alerts.length === 0) return 0;
+
+  // Count alerts in different windows
+  let last1h = 0, last6h = 0, last24h = 0, last7d = 0;
+  for (const a of alerts) {
+    const ageMs = nowMs - new Date(a.alert_datetime).getTime();
+    if (ageMs < 1 * 60 * 60 * 1000) last1h++;
+    if (ageMs < 6 * 60 * 60 * 1000) last6h++;
+    if (ageMs < 24 * 60 * 60 * 1000) last24h++;
+    if (ageMs < 7 * 24 * 60 * 60 * 1000) last7d++;
+  }
+
+  // Alerts per hour in each window, normalized to 0-100
+  const rateScores = [
+    Math.min(100, last1h * 8),              // 12+ alerts/hour = 100
+    Math.min(100, (last6h / 6) * 12),       // ~8 alerts/hour avg over 6h = 100
+    Math.min(100, (last24h / 24) * 15),     // ~7 alerts/hour avg over 24h = 100
+    Math.min(100, (last7d / 168) * 25),     // ~4 alerts/hour avg over 7d = 100
+  ];
+
+  // Take the max — a burst in any window counts
+  return Math.max(...rateScores);
+}
+
+/**
+ * Factor 3: Time-of-Day Pattern (0-100)
+ * Do historical attacks tend to happen at this time of day?
+ * Looks at ±2 hour window from current Israel time.
+ */
+function scoreTimePattern(alerts: any[], currentIsraelHour: number): number {
+  if (alerts.length === 0) return 0;
+
+  // Count alerts in ±2h window vs total
+  const windowHours = new Set<number>();
+  for (let h = currentIsraelHour - 2; h <= currentIsraelHour + 2; h++) {
+    windowHours.add(((h % 24) + 24) % 24);
+  }
+
+  let inWindow = 0;
+  for (const a of alerts) {
+    if (windowHours.has(getIsraelHour(new Date(a.alert_datetime)))) inWindow++;
+  }
+
+  // What fraction of alerts happen in this time window?
+  // 5/24 = ~21% would be expected by chance
+  const fraction = inWindow / alerts.length;
+  const expectedFraction = 5 / 24; // 5 hours out of 24
+
+  if (fraction <= expectedFraction) return Math.round(fraction / expectedFraction * 30); // Below average: 0-30
+  // Above average: 30-100, scaled by how much above expected
+  return Math.round(30 + 70 * Math.min(1, (fraction - expectedFraction) / (0.5 - expectedFraction)));
+}
+
+/**
+ * Factor 4: Trend / Escalation (0-100)
+ * Is the attack rate increasing or decreasing?
+ * Compares last 24h to previous 48h (the 24-72h window).
+ */
+function scoreTrend(alerts: any[], nowMs: number): { score: number; direction: string } {
+  const last24h = alerts.filter((a: any) => nowMs - new Date(a.alert_datetime).getTime() < 24 * 60 * 60 * 1000);
+  const prev48h = alerts.filter((a: any) => {
+    const age = nowMs - new Date(a.alert_datetime).getTime();
+    return age >= 24 * 60 * 60 * 1000 && age < 72 * 60 * 60 * 1000;
+  });
+
+  const recentRate = last24h.length / 1; // alerts per day (last 1 day)
+  const olderRate = prev48h.length / 2;  // alerts per day (2-day window)
+
+  if (olderRate === 0 && recentRate === 0) return { score: 0, direction: 'stable' };
+  if (olderRate === 0 && recentRate > 0) return { score: 85, direction: 'rising' }; // New escalation
+
+  const ratio = recentRate / olderRate;
+
+  let direction = 'stable';
+  if (ratio > 1.5) direction = 'rising';
+  else if (ratio < 0.5) direction = 'falling';
+
+  // Score: ratio of 2x+ = 100, 1x = 50, 0x = 0
+  const score = Math.min(100, Math.max(0, ratio * 50));
+  return { score, direction };
+}
+
+/**
+ * Factor 5: Regional Spillover (0-100)
+ * Are neighboring regions experiencing alerts?
+ * If your neighbors are getting hit, you're more likely to be next.
+ */
+function scoreRegionalSpill(
+  regionSlug: string,
+  allAlertsByRegion: Record<string, any[]>,
+  nowMs: number
+): number {
+  const neighbors = NEIGHBORS[regionSlug] ?? [];
+  if (neighbors.length === 0) return 0;
+
+  let neighborScore = 0;
+  for (const n of neighbors) {
+    const nAlerts = allAlertsByRegion[n] ?? [];
+    // Count alerts in last 6h from this neighbor
+    const recentCount = nAlerts.filter(
+      (a: any) => nowMs - new Date(a.alert_datetime).getTime() < 6 * 60 * 60 * 1000
+    ).length;
+
+    if (recentCount > 0) {
+      // Each active neighbor contributes, diminishing returns
+      neighborScore += Math.min(40, recentCount * 5);
+    }
+  }
+
+  return Math.min(100, neighborScore);
+}
+
 async function calculateAll() {
   const now = new Date();
-  console.log(`[${now.toISOString()}] Calculating probabilities...`);
+  const nowMs = now.getTime();
+  console.log(`[${now.toISOString()}] Calculating probabilities (improved model v2)...`);
 
-  // Fetch all alerts from last 7 days
-  const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  // Fetch all alerts from last 30 days for comprehensive analysis
+  const thirtyDaysAgo = new Date(nowMs - 30 * 24 * 60 * 60 * 1000);
 
   const { data: alerts, error } = await db
     .from('alerts')
     .select('*')
-    .gte('alert_datetime', sevenDaysAgo.toISOString())
+    .gte('alert_datetime', thirtyDaysAgo.toISOString())
     .order('alert_datetime', { ascending: false });
 
   if (error) {
@@ -31,90 +192,63 @@ async function calculateAll() {
     process.exit(1);
   }
 
-  console.log(`Found ${alerts?.length ?? 0} alerts in last 7 days`);
+  console.log(`Found ${alerts?.length ?? 0} alerts in last 30 days`);
 
+  // Group alerts by region
+  const alertsByRegion: Record<string, any[]> = {};
+  for (const r of REGIONS) alertsByRegion[r] = [];
+  for (const a of alerts ?? []) {
+    if (alertsByRegion[a.region_slug]) {
+      alertsByRegion[a.region_slug].push(a);
+    }
+  }
+
+  const currentIsraelHour = getIsraelHour(now);
   const snapshots = [];
 
   for (const regionSlug of REGIONS) {
-    const regionAlerts = (alerts ?? []).filter((a: any) => a.region_slug === regionSlug);
+    const regionAlerts = alertsByRegion[regionSlug];
 
-    const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-    const twoDaysAgo = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
-    const fiveMinAgo = new Date(now.getTime() - 5 * 60 * 1000);
+    // Calculate each factor
+    const recentActivity = scoreRecentActivity(regionAlerts, nowMs);
+    const intensity = scoreIntensity(regionAlerts, nowMs);
+    const timePattern = scoreTimePattern(regionAlerts, currentIsraelHour);
+    const { score: trendScore, direction: trendDirection } = scoreTrend(regionAlerts, nowMs);
+    const regionalSpill = scoreRegionalSpill(regionSlug, alertsByRegion, nowMs);
 
-    const alertsLast24h = regionAlerts.filter((a: any) => new Date(a.alert_datetime) >= oneDayAgo);
-    const alertsLast7d = regionAlerts;
-    const alertsLast2d = regionAlerts.filter((a: any) => new Date(a.alert_datetime) >= twoDaysAgo);
-    const alertsDays3to7 = alertsLast7d.filter((a: any) => new Date(a.alert_datetime) < twoDaysAgo);
-
-    const hasActiveAlert = regionAlerts.some((a: any) => new Date(a.alert_datetime) >= fiveMinAgo);
-
-    if (hasActiveAlert) {
-      snapshots.push({
-        region_slug: regionSlug,
-        calculated_at: now.toISOString(),
-        probability_score: 100,
-        alert_count_24h: alertsLast24h.length,
-        alert_count_7d: alertsLast7d.length,
-        trend_direction: 'rising',
-        has_active_alert: true,
-      });
-      continue;
-    }
-
-    // Frequency score: ratio of 15-min windows with alerts over 7 days
-    const totalWindows = 7 * 24 * 4; // 672 possible windows
-    const windows = new Set<string>();
-    for (const a of alertsLast7d) {
-      const d = new Date((a as any).alert_datetime);
-      const israelHour = getIsraelHour(d);
-      windows.add(`${d.toISOString().split('T')[0]}-${israelHour}-${Math.floor(d.getMinutes() / 15)}`);
-    }
-    const frequencyScore = Math.min(100, Math.log1p((windows.size / totalWindows) * 100) * 30);
-
-    // Recency score: exponential decay based on most recent alert
-    let recencyScore = 0;
-    if (alertsLast7d.length > 0) {
-      const mostRecent = Math.max(...alertsLast7d.map((a: any) => new Date(a.alert_datetime).getTime()));
-      recencyScore = 100 * Math.exp(-0.693 * (now.getTime() - mostRecent) / RECENCY_HALF_LIFE_MS);
-    }
-
-    // Time pattern score: alerts at similar time of day (Israel time)
-    const currentHour = getIsraelHour(now);
-    const hourWindow = [currentHour - 1, currentHour, currentHour + 1].map(h => ((h % 24) + 24) % 24);
-    const timePatternScore = Math.min(100, alertsLast7d.filter(
-      (a: any) => hourWindow.includes(getIsraelHour(new Date(a.alert_datetime)))
-    ).length * 15);
-
-    // Trend score: compare recent 2 days vs older 5 days
-    let trendScore = 0;
-    const recentRate = alertsLast2d.length / 2;
-    const olderRate = alertsDays3to7.length / 5;
-    if (olderRate > 0) {
-      trendScore = Math.min(100, Math.max(0, (recentRate / olderRate) * 50));
-    } else if (alertsLast2d.length > 0) {
-      trendScore = 80;
-    }
-
-    let trendDirection: string = 'stable';
-    if (recentRate > olderRate * 1.3) trendDirection = 'rising';
-    else if (recentRate < olderRate * 0.7) trendDirection = 'falling';
-
+    // Weighted combination
     const rawScore =
-      WEIGHTS.frequency * frequencyScore +
-      WEIGHTS.recency * recencyScore +
-      WEIGHTS.timePattern * timePatternScore +
-      WEIGHTS.trend * trendScore;
+      W.recentActivity * recentActivity +
+      W.intensity * intensity +
+      W.timePattern * timePattern +
+      W.trend * trendScore +
+      W.regionalSpill * regionalSpill;
+
+    // Count stats
+    const oneDayAgo = nowMs - 24 * 60 * 60 * 1000;
+    const sevenDaysAgo = nowMs - 7 * 24 * 60 * 60 * 1000;
+    const fiveMinAgo = nowMs - 5 * 60 * 1000;
+    const alertsLast24h = regionAlerts.filter((a: any) => new Date(a.alert_datetime).getTime() >= oneDayAgo);
+    const alertsLast7d = regionAlerts.filter((a: any) => new Date(a.alert_datetime).getTime() >= sevenDaysAgo);
+    const hasActiveAlert = regionAlerts.some((a: any) => new Date(a.alert_datetime).getTime() >= fiveMinAgo);
+
+    // Final score: cap at 98% (100% only during active alert within 5 min)
+    let finalScore = Math.round(rawScore);
+    if (hasActiveAlert) finalScore = Math.max(finalScore, 95);
+    finalScore = Math.min(98, finalScore);
+    if (hasActiveAlert && recentActivity >= 98) finalScore = 100;
 
     snapshots.push({
       region_slug: regionSlug,
       calculated_at: now.toISOString(),
-      probability_score: Math.min(95, Math.round(rawScore)),
+      probability_score: finalScore,
       alert_count_24h: alertsLast24h.length,
       alert_count_7d: alertsLast7d.length,
       trend_direction: trendDirection,
-      has_active_alert: false,
+      has_active_alert: hasActiveAlert,
     });
+
+    console.log(`  ${regionSlug}: ${finalScore}% [recent=${Math.round(recentActivity)} intensity=${Math.round(intensity)} time=${Math.round(timePattern)} trend=${Math.round(trendScore)}(${trendDirection}) spill=${Math.round(regionalSpill)}] 24h:${alertsLast24h.length} 7d:${alertsLast7d.length}`);
   }
 
   // Insert all snapshots
@@ -125,10 +259,7 @@ async function calculateAll() {
     process.exit(1);
   }
 
-  console.log(`Inserted ${snapshots.length} probability snapshots`);
-  for (const s of snapshots) {
-    console.log(`  ${s.region_slug}: ${s.probability_score}% (${s.trend_direction}, 24h: ${s.alert_count_24h}, 7d: ${s.alert_count_7d})`);
-  }
+  console.log(`\nInserted ${snapshots.length} probability snapshots`);
 }
 
 calculateAll();
