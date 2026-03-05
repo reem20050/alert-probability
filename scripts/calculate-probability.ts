@@ -8,6 +8,11 @@ const REGIONS = [
 const WEIGHTS = { frequency: 0.35, recency: 0.30, timePattern: 0.20, trend: 0.15 };
 const RECENCY_HALF_LIFE_MS = 6 * 60 * 60 * 1000;
 
+/** Get hour (0-23) in Israel timezone */
+function getIsraelHour(date: Date): number {
+  return parseInt(date.toLocaleString('en-US', { timeZone: 'Asia/Jerusalem', hour: 'numeric', hour12: false }));
+}
+
 async function calculateAll() {
   const now = new Date();
   console.log(`[${now.toISOString()}] Calculating probabilities...`);
@@ -62,7 +67,8 @@ async function calculateAll() {
     const windows = new Set<string>();
     for (const a of alertsLast7d) {
       const d = new Date((a as any).alert_datetime);
-      windows.add(`${d.toISOString().split('T')[0]}-${d.getHours()}-${Math.floor(d.getMinutes() / 15)}`);
+      const israelHour = getIsraelHour(d);
+      windows.add(`${d.toISOString().split('T')[0]}-${israelHour}-${Math.floor(d.getMinutes() / 15)}`);
     }
     const frequencyScore = Math.min(100, Math.log1p((windows.size / totalWindows) * 100) * 30);
 
@@ -73,11 +79,11 @@ async function calculateAll() {
       recencyScore = 100 * Math.exp(-0.693 * (now.getTime() - mostRecent) / RECENCY_HALF_LIFE_MS);
     }
 
-    // Time pattern score: alerts at similar time of day
-    const currentHour = now.getHours();
+    // Time pattern score: alerts at similar time of day (Israel time)
+    const currentHour = getIsraelHour(now);
     const hourWindow = [currentHour - 1, currentHour, currentHour + 1].map(h => ((h % 24) + 24) % 24);
     const timePatternScore = Math.min(100, alertsLast7d.filter(
-      (a: any) => hourWindow.includes(new Date(a.alert_datetime).getHours())
+      (a: any) => hourWindow.includes(getIsraelHour(new Date(a.alert_datetime)))
     ).length * 15);
 
     // Trend score: compare recent 2 days vs older 5 days

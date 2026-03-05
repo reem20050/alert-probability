@@ -56,7 +56,11 @@ async function getRegionData(slug: string) {
 
   const hourlyCounts = new Array(24).fill(0);
   alertsRes.data?.forEach((a: Record<string, unknown>) => {
-    hourlyCounts[new Date(a.alert_datetime as string).getHours()]++;
+    const d = new Date(a.alert_datetime as string);
+    const israelHour = parseInt(
+      d.toLocaleString('en-US', { timeZone: 'Asia/Jerusalem', hour: 'numeric', hour12: false })
+    );
+    hourlyCounts[israelHour]++;
   });
 
   return {
@@ -177,6 +181,7 @@ export default async function RegionPage({
                     {new Date(
                       alert.alert_datetime as string
                     ).toLocaleString('he-IL', {
+                      timeZone: 'Asia/Jerusalem',
                       day: 'numeric',
                       month: 'numeric',
                       hour: '2-digit',
