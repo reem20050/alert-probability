@@ -4,11 +4,12 @@ import { getProbabilityLevel } from '@/lib/constants';
 import ProbabilityGauge from '@/components/ProbabilityGauge';
 import TrendChart from '@/components/TrendChart';
 import HourlyHeatmap from '@/components/HourlyHeatmap';
+import AutoRefresh from '@/components/AutoRefresh';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import type { Metadata } from 'next';
 
-export const revalidate = 60; // 1 minute
+export const revalidate = 30; // 30 seconds ISR
 
 export async function generateStaticParams() {
   return getAllRegionSlugs().map((slug) => ({ slug }));
@@ -21,10 +22,10 @@ export async function generateMetadata({
 }): Promise<Metadata> {
   const { slug } = await params;
   const region = getRegionBySlug(slug);
-  if (!region) return { title: '\u05D0\u05D6\u05D5\u05E8 \u05DC\u05D0 \u05E0\u05DE\u05E6\u05D0' };
+  if (!region) return { title: 'אזור לא נמצא' };
   return {
-    title: `\u05E1\u05D9\u05DB\u05D5\u05D9 \u05D0\u05D6\u05E2\u05E7\u05D4 - ${region.name_he}`,
-    description: `\u05D4\u05E1\u05EA\u05D1\u05E8\u05D5\u05EA \u05D0\u05D6\u05E2\u05E7\u05D4 \u05D1${region.name_he} - \u05E0\u05D9\u05EA\u05D5\u05D7 \u05E1\u05D8\u05D8\u05D9\u05E1\u05D8\u05D9`,
+    title: `סיכוי אזעקה - ${region.name_he}`,
+    description: `הסתברות אזעקה ב${region.name_he} - ניתוח סטטיסטי`,
   };
 }
 
@@ -58,7 +59,11 @@ async function getRegionData(slug: string) {
   alertsRes.data?.forEach((a: Record<string, unknown>) => {
     const d = new Date(a.alert_datetime as string);
     const israelHour = parseInt(
-      d.toLocaleString('en-US', { timeZone: 'Asia/Jerusalem', hour: 'numeric', hour12: false })
+      d.toLocaleString('en-US', {
+        timeZone: 'Asia/Jerusalem',
+        hour: 'numeric',
+        hour12: false,
+      })
     );
     hourlyCounts[israelHour]++;
   });
@@ -90,11 +95,14 @@ export default async function RegionPage({
 
   return (
     <div>
+      {/* Auto-refresh every 60 seconds */}
+      <AutoRefresh intervalMs={60_000} />
+
       <Link
         href="/"
         className="text-sm text-gray-400 hover:text-white mb-4 inline-block"
       >
-        {'\u2190 \u05D7\u05D6\u05E8\u05D4 \u05DC\u05DB\u05DC \u05D4\u05D0\u05D6\u05D5\u05E8\u05D9\u05DD'}
+        ← חזרה לכל האזורים
       </Link>
 
       <div className="flex items-start justify-between mb-8">
@@ -109,27 +117,23 @@ export default async function RegionPage({
 
       {/* Stats cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-8">
+        <StatCard label="סיכוי נוכחי" value={`${score}%`} color={level.color} />
         <StatCard
-          label={'\u05E1\u05D9\u05DB\u05D5\u05D9 \u05E0\u05D5\u05DB\u05D7\u05D9'}
-          value={`${score}%`}
-          color={level.color}
-        />
-        <StatCard
-          label={'\u05D4\u05EA\u05E8\u05E2\u05D5\u05EA 24 \u05E9\u05E2\u05D5\u05EA'}
+          label="התרעות 24 שעות"
           value={data.current?.alert_count_24h?.toString() ?? '0'}
         />
         <StatCard
-          label={'\u05D4\u05EA\u05E8\u05E2\u05D5\u05EA 7 \u05D9\u05DE\u05D9\u05DD'}
+          label="התרעות 7 ימים"
           value={data.current?.alert_count_7d?.toString() ?? '0'}
         />
         <StatCard
-          label={'\u05DE\u05D2\u05DE\u05D4'}
+          label="מגמה"
           value={
             data.current?.trend_direction === 'rising'
-              ? '\u2191 \u05E2\u05D5\u05DC\u05D4'
+              ? '↑ עולה'
               : data.current?.trend_direction === 'falling'
-                ? '\u2193 \u05D9\u05D5\u05E8\u05D3'
-                : '\u2192 \u05D9\u05E6\u05D9\u05D1'
+                ? '↓ יורד'
+                : '→ יציב'
           }
           color={
             data.current?.trend_direction === 'rising'
@@ -144,7 +148,7 @@ export default async function RegionPage({
       {/* Trend chart */}
       <div className="rounded-xl border border-gray-800 bg-gray-900/50 p-5 mb-6">
         <h3 className="text-lg font-semibold mb-4">
-          {'\u05DE\u05D2\u05DE\u05EA \u05E1\u05D9\u05DB\u05D5\u05D9 - 7 \u05D9\u05DE\u05D9\u05DD \u05D0\u05D7\u05E8\u05D5\u05E0\u05D9\u05DD'}
+          מגמת סיכוי - 7 ימים אחרונים
         </h3>
         <TrendChart data={data.trend} regionName={region.name_he} />
       </div>
@@ -152,19 +156,17 @@ export default async function RegionPage({
       {/* Hourly heatmap */}
       <div className="rounded-xl border border-gray-800 bg-gray-900/50 p-5 mb-6">
         <h3 className="text-lg font-semibold mb-4">
-          {'\u05D4\u05EA\u05E4\u05DC\u05D2\u05D5\u05EA \u05E9\u05E2\u05EA\u05D9\u05EA \u05E9\u05DC \u05D4\u05EA\u05E8\u05E2\u05D5\u05EA'}
+          התפלגות שעתית של התרעות
         </h3>
         <HourlyHeatmap hourlyCounts={data.hourlyCounts} />
       </div>
 
       {/* Recent alerts */}
       <div className="rounded-xl border border-gray-800 bg-gray-900/50 p-5">
-        <h3 className="text-lg font-semibold mb-4">
-          {'\u05D4\u05EA\u05E8\u05E2\u05D5\u05EA \u05D0\u05D7\u05E8\u05D5\u05E0\u05D5\u05EA'}
-        </h3>
+        <h3 className="text-lg font-semibold mb-4">התרעות אחרונות</h3>
         {data.alerts.length === 0 ? (
           <p className="text-gray-500 text-sm">
-            {'\u05D0\u05D9\u05DF \u05D4\u05EA\u05E8\u05E2\u05D5\u05EA \u05D1-7 \u05D4\u05D9\u05DE\u05D9\u05DD \u05D4\u05D0\u05D7\u05E8\u05D5\u05E0\u05D9\u05DD'}
+            אין התרעות ב-7 הימים האחרונים
           </p>
         ) : (
           <div className="space-y-2 max-h-96 overflow-y-auto">

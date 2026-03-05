@@ -13,7 +13,7 @@ export default function RegionCard({ region }: Props) {
   const score = region.probability?.probability_score ?? 0;
   const level = getProbabilityLevel(score);
   const trend = region.probability?.trend_direction ?? 'stable';
-  const trendIcon = trend === 'rising' ? '\u2191' : trend === 'falling' ? '\u2193' : '\u2192';
+  const trendIcon = trend === 'rising' ? '↑' : trend === 'falling' ? '↓' : '→';
   const trendColor =
     trend === 'rising'
       ? 'text-red-400'
@@ -23,7 +23,7 @@ export default function RegionCard({ region }: Props) {
 
   const updatedAt = region.probability?.calculated_at
     ? getTimeAgo(new Date(region.probability.calculated_at))
-    : '\u05D0\u05D9\u05DF \u05E0\u05EA\u05D5\u05E0\u05D9\u05DD';
+    : 'אין נתונים';
 
   return (
     <Link href={`/region/${region.slug}`}>
@@ -39,9 +39,7 @@ export default function RegionCard({ region }: Props) {
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75" />
               <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500" />
             </span>
-            <span className="text-xs text-red-400 font-medium">
-              {'\u05D0\u05D6\u05E2\u05E7\u05D4 \u05E4\u05E2\u05D9\u05DC\u05D4'}
-            </span>
+            <span className="text-xs text-red-400 font-medium">אזעקה פעילה</span>
           </div>
         )}
 
@@ -56,13 +54,13 @@ export default function RegionCard({ region }: Props) {
         <div className="mt-4 flex items-center justify-between text-sm">
           <div className="flex gap-3">
             <span className="text-gray-400">
-              24\u05E9:{' '}
+              24ש:{' '}
               <span className="text-white font-medium">
                 {region.probability?.alert_count_24h ?? 0}
               </span>
             </span>
             <span className="text-gray-400">
-              7\u05D9:{' '}
+              7י:{' '}
               <span className="text-white font-medium">
                 {region.probability?.alert_count_7d ?? 0}
               </span>
@@ -70,16 +68,12 @@ export default function RegionCard({ region }: Props) {
           </div>
           <span className={`font-medium ${trendColor}`}>
             {trendIcon}{' '}
-            {trend === 'rising'
-              ? '\u05E2\u05D5\u05DC\u05D4'
-              : trend === 'falling'
-                ? '\u05D9\u05D5\u05E8\u05D3'
-                : '\u05D9\u05E6\u05D9\u05D1'}
+            {trend === 'rising' ? 'עולה' : trend === 'falling' ? 'יורד' : 'יציב'}
           </span>
         </div>
 
         <div className="mt-2 text-xs text-gray-500 text-center">
-          {'\u05E2\u05D3\u05DB\u05D5\u05DF'}: {updatedAt}
+          עדכון: {updatedAt}
         </div>
       </div>
     </Link>
@@ -91,10 +85,9 @@ function getTimeAgo(date: Date): string {
   const diffMs = now.getTime() - date.getTime();
   const diffMin = Math.floor(diffMs / 60000);
 
-  if (diffMin < 1) return '\u05DB\u05E8\u05D2\u05E2';
-  if (diffMin < 60) return `\u05DC\u05E4\u05E0\u05D9 ${diffMin} \u05D3\u05E7\u05D5\u05EA`;
+  if (diffMin < 1) return 'כרגע';
+  if (diffMin < 60) return `לפני ${diffMin} דקות`;
   const diffHours = Math.floor(diffMin / 60);
-  if (diffHours < 24)
-    return `\u05DC\u05E4\u05E0\u05D9 ${diffHours} \u05E9\u05E2\u05D5\u05EA`;
-  return `\u05DC\u05E4\u05E0\u05D9 ${Math.floor(diffHours / 24)} \u05D9\u05DE\u05D9\u05DD`;
+  if (diffHours < 24) return `לפני ${diffHours} שעות`;
+  return `לפני ${Math.floor(diffHours / 24)} ימים`;
 }

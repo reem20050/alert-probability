@@ -3,7 +3,7 @@ import './globals.css';
 
 export const metadata: Metadata = {
   title: 'סיכוי אזעקה - מפת הסתברות התרעות',
-  description: 'לוח מחוונים המציג את הסתברות האזעקות לפי אזורים בישראל, מתעדכן כל 15 דקות',
+  description: 'לוח מחוונים המציג את הסתברות האזעקות לפי אזורים בישראל, מתעדכן כל 5 דקות',
   icons: { icon: '/favicon.ico' },
 };
 

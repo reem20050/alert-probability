@@ -27,7 +27,7 @@ export default function HourlyHeatmap({ hourlyCounts }: Props) {
             <div key={hour} className="flex flex-col items-center">
               <div
                 className={`w-full aspect-square rounded ${bg} flex items-center justify-center text-xs transition-colors`}
-                title={`${hour}:00 - ${count} \u05D4\u05EA\u05E8\u05E2\u05D5\u05EA`}
+                title={`${hour}:00 - ${count} התרעות`}
                 style={{ opacity: 0.3 + intensity * 0.7 }}
               >
                 {count > 0 && <span className="text-[10px]">{count}</span>}
@@ -38,7 +38,7 @@ export default function HourlyHeatmap({ hourlyCounts }: Props) {
         })}
       </div>
       <div className="flex items-center justify-center gap-2 mt-2 text-xs text-gray-500">
-        <span>{'\u05E4\u05D7\u05D5\u05EA'}</span>
+        <span>פחות</span>
         <div className="flex gap-0.5">
           <div className="w-3 h-3 rounded bg-gray-800" />
           <div className="w-3 h-3 rounded bg-green-900" />
@@ -46,7 +46,7 @@ export default function HourlyHeatmap({ hourlyCounts }: Props) {
           <div className="w-3 h-3 rounded bg-orange-900" />
           <div className="w-3 h-3 rounded bg-red-900" />
         </div>
-        <span>{'\u05D9\u05D5\u05EA\u05E8'}</span>
+        <span>יותר</span>
       </div>
     </div>
   );

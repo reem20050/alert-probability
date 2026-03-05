@@ -16,6 +16,8 @@ export function getProbabilityColor(score: number): string {
   return getProbabilityLevel(score).color;
 }
 
-export const REFRESH_INTERVAL_MS = 60_000; // 1 minute client-side refresh
-export const REVALIDATE_SECONDS = 900; // 15 minutes ISR
+export const REFRESH_INTERVAL_MS = 60_000; // 1 minute client-side auto-refresh
+export const CALC_INTERVAL_MIN = 5; // probability recalculated every 5 minutes
+export const FETCH_INTERVAL_MIN = 5; // alerts fetched every 5 minutes
+export const REVALIDATE_SECONDS = 30; // ISR revalidation
 export const TZEVAADOM_API_URL = 'https://api.tzevaadom.co.il/notifications';

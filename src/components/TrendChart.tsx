@@ -24,7 +24,7 @@ export default function TrendChart({ data, regionName }: Props) {
   if (data.length === 0) {
     return (
       <div className="h-64 flex items-center justify-center text-gray-500">
-        {'\u05D0\u05D9\u05DF \u05E0\u05EA\u05D5\u05E0\u05D9\u05DD \u05DC\u05D4\u05E6\u05D2\u05D4'}
+        אין נתונים להצגה
       </div>
     );
   }
@@ -54,7 +54,7 @@ export default function TrendChart({ data, regionName }: Props) {
             labelFormatter={(v: string) => new Date(v).toLocaleString('he-IL')}
             formatter={(value: number) => [
               `${value}%`,
-              '\u05E1\u05D9\u05DB\u05D5\u05D9',
+              'סיכוי',
             ]}
           />
           <Line
