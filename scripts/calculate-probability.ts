@@ -1,334 +1,423 @@
 import { db } from './db';
 
+// ============================================================
+// ML-based Alert Probability — Logistic Regression v3
+//
+// Trains a per-region logistic regression model on sliding-window
+// features extracted from alert event time series.
+//
+// Features (10): recency, intensity at multiple scales, time-of-day
+//   pattern, neighbor activity, trend, city spread.
+// Target: was there an alert in the next 60 minutes?
+// Model: sigmoid(w·x + b), trained with gradient descent + L2 reg.
+// ============================================================
+
 const REGIONS = [
   'gush-dan', 'sharon', 'shfela', 'negev', 'haifa',
-  'galilee', 'jerusalem', 'gaza-envelope', 'judea-samaria', 'eilat-arava'
+  'galilee', 'jerusalem', 'gaza-envelope', 'judea-samaria', 'eilat-arava',
 ];
 
-/**
- * Current conflict start date — train the model ONLY on data from this war.
- * Update this when a new conflict phase begins or after a significant ceasefire.
- * Set to null to use the default 30-day rolling window instead.
- */
-const CURRENT_CONFLICT_START = new Date('2025-10-01T00:00:00+02:00');
-
-// Regional adjacency map for spillover scoring
 const NEIGHBORS: Record<string, string[]> = {
-  'gush-dan':       ['sharon', 'shfela', 'jerusalem'],
-  'sharon':         ['gush-dan', 'haifa', 'judea-samaria'],
-  'shfela':         ['gush-dan', 'jerusalem', 'gaza-envelope', 'negev'],
-  'negev':          ['shfela', 'gaza-envelope', 'eilat-arava'],
-  'haifa':          ['sharon', 'galilee'],
-  'galilee':        ['haifa', 'judea-samaria'],
-  'jerusalem':      ['gush-dan', 'shfela', 'judea-samaria'],
-  'gaza-envelope':  ['shfela', 'negev'],
-  'judea-samaria':  ['sharon', 'galilee', 'jerusalem'],
-  'eilat-arava':    ['negev'],
+  'gush-dan':      ['sharon', 'shfela', 'jerusalem'],
+  'sharon':        ['gush-dan', 'haifa', 'judea-samaria'],
+  'shfela':        ['gush-dan', 'jerusalem', 'gaza-envelope', 'negev'],
+  'negev':         ['shfela', 'gaza-envelope', 'eilat-arava'],
+  'haifa':         ['sharon', 'galilee'],
+  'galilee':       ['haifa', 'judea-samaria'],
+  'jerusalem':     ['gush-dan', 'shfela', 'judea-samaria'],
+  'gaza-envelope': ['shfela', 'negev'],
+  'judea-samaria': ['sharon', 'galilee', 'jerusalem'],
+  'eilat-arava':   ['negev'],
 };
 
-// Weights for each factor
-const W = {
-  recentActivity: 0.30,   // How recently were there alerts?
-  intensity:      0.25,   // How intense is the current attack?
-  timePattern:    0.15,   // Do attacks happen at this time of day?
-  trend:          0.15,   // Is the situation escalating?
-  regionalSpill:  0.15,   // Are neighboring regions being attacked?
-};
+const HOUR_MS = 3_600_000;
+const DAY_MS = 86_400_000;
+const NUM_FEATURES = 10;
+const PREDICTION_WINDOW_MS = 60 * 60 * 1000; // predict next 1 hour
+const WINDOW_STEP_MS = 15 * 60 * 1000;       // 15-min sliding window
 
-/** Get hour (0-23) in Israel timezone */
-function getIsraelHour(date: Date): number {
-  return parseInt(date.toLocaleString('en-US', { timeZone: 'Asia/Jerusalem', hour: 'numeric', hour12: false }));
+// ============================================================
+// Alert Event Deduplication — 2-minute window grouping
+// ============================================================
+
+interface AlertEvent {
+  ts: number;          // milliseconds since epoch
+  city_count: number;  // how many cities in this salvo
 }
 
-/**
- * Deduplicate alerts: group alerts within a 2-minute window into single "events".
- * When a rocket salvo hits a region, multiple cities get alerts within seconds.
- * We treat these as ONE event, not 15+ separate alerts.
- *
- * Returns an array of "event" objects, each with:
- * - alert_datetime: the earliest alert in the group (event start)
- * - city_count: how many cities were alerted in this event
- */
-function deduplicateAlerts(alerts: any[]): { alert_datetime: string; city_count: number }[] {
+function deduplicateAlerts(alerts: any[]): AlertEvent[] {
   if (alerts.length === 0) return [];
-
-  // Sort by datetime ascending
   const sorted = [...alerts].sort(
     (a, b) => new Date(a.alert_datetime).getTime() - new Date(b.alert_datetime).getTime()
   );
-
-  const events: { alert_datetime: string; city_count: number }[] = [];
+  const events: AlertEvent[] = [];
   let eventStart = new Date(sorted[0].alert_datetime).getTime();
-  let eventDatetime = sorted[0].alert_datetime;
-  let cityCount = 1;
+  let cities = 1;
 
   for (let i = 1; i < sorted.length; i++) {
     const ts = new Date(sorted[i].alert_datetime).getTime();
-    if (ts - eventStart <= 2 * 60 * 1000) {
-      // Within 2-minute window — same event
-      cityCount++;
+    if (ts - eventStart <= 120_000) {     // 2-minute window
+      cities++;
     } else {
-      // New event
-      events.push({ alert_datetime: eventDatetime, city_count: cityCount });
+      events.push({ ts: eventStart, city_count: cities });
       eventStart = ts;
-      eventDatetime = sorted[i].alert_datetime;
-      cityCount = 1;
+      cities = 1;
     }
   }
-  // Push last event
-  events.push({ alert_datetime: eventDatetime, city_count: cityCount });
-
+  events.push({ ts: eventStart, city_count: cities });
   return events;
 }
 
-/**
- * Factor 1: Recent Activity (0-100)
- * Multi-timescale scoring — the more recent the alerts, the higher the score.
- * Uses tiered windows with exponential decay within each tier.
- * Now operates on deduplicated events (not raw alerts).
- */
-function scoreRecentActivity(events: { alert_datetime: string; city_count: number }[], nowMs: number): number {
-  if (events.length === 0) return 0;
+// ============================================================
+// Feature Extraction (10 features per region per timestamp)
+// ============================================================
 
-  const mostRecentMs = Math.max(...events.map(e => new Date(e.alert_datetime).getTime()));
-  const ageMinutes = (nowMs - mostRecentMs) / (60 * 1000);
-
-  // Tiered scoring based on recency
-  if (ageMinutes <= 5)   return 98;  // Active right now
-  if (ageMinutes <= 15)  return 92;  // Just happened
-  if (ageMinutes <= 60)  return 75 + (1 - ageMinutes / 60) * 15;  // Last hour: 75-90
-  if (ageMinutes <= 360) return 45 + (1 - ageMinutes / 360) * 30;  // Last 6h: 45-75
-  if (ageMinutes <= 1440) return 20 + (1 - ageMinutes / 1440) * 25; // Last 24h: 20-45
-  if (ageMinutes <= 4320) return 8 + (1 - ageMinutes / 4320) * 12;  // Last 3d: 8-20
-  if (ageMinutes <= 10080) return 2 + (1 - ageMinutes / 10080) * 6; // Last 7d: 2-8
-  return Math.max(0, 2 * Math.exp(-ageMinutes / 20160)); // Beyond 7d: exponential decay
+function getIsraelHour(ms: number): number {
+  return parseInt(
+    new Date(ms).toLocaleString('en-US', { timeZone: 'Asia/Jerusalem', hour: 'numeric', hour12: false })
+  );
 }
 
 /**
- * Factor 2: Attack Intensity (0-100)
- * How many alert EVENTS happened in recent time windows.
- * A burst of 5 salvos in an hour matters more than 5 spread over a week.
- * Now operates on deduplicated events (not raw alerts).
+ * Extract 10 features for a region at a specific timestamp.
+ *
+ *  0  count_1h       log1p of events in last 1h (normalized)
+ *  1  count_3h       log1p of events in last 3h
+ *  2  count_6h       log1p of events in last 6h
+ *  3  count_24h      log1p of events in last 24h
+ *  4  recency        1 - min(1, minutes_since_last / 1440)
+ *  5  hour_sin       sin(2pi * hour / 24)
+ *  6  hour_cos       cos(2pi * hour / 24)
+ *  7  neighbor_3h    log1p of neighbor events in last 3h
+ *  8  trend          ratio of last 3h to prev 3h events (capped)
+ *  9  city_spread    avg cities per event in last 3h (normalized)
  */
-function scoreIntensity(events: { alert_datetime: string; city_count: number }[], nowMs: number): number {
-  if (events.length === 0) return 0;
-
-  // Count events in different windows
-  let last1h = 0, last6h = 0, last24h = 0, last7d = 0;
-  for (const e of events) {
-    const ageMs = nowMs - new Date(e.alert_datetime).getTime();
-    if (ageMs < 1 * 60 * 60 * 1000) last1h++;
-    if (ageMs < 6 * 60 * 60 * 1000) last6h++;
-    if (ageMs < 24 * 60 * 60 * 1000) last24h++;
-    if (ageMs < 7 * 24 * 60 * 60 * 1000) last7d++;
-  }
-
-  // Events per hour in each window, normalized to 0-100
-  // Thresholds adjusted: events are fewer than raw alerts
-  const rateScores = [
-    Math.min(100, last1h * 20),             // 5+ events/hour = 100
-    Math.min(100, (last6h / 6) * 25),       // ~4 events/hour avg over 6h = 100
-    Math.min(100, (last24h / 24) * 35),     // ~3 events/hour avg over 24h = 100
-    Math.min(100, (last7d / 168) * 60),     // ~2 events/hour avg over 7d = 100
-  ];
-
-  // Take the max — a burst in any window counts
-  return Math.max(...rateScores);
-}
-
-/**
- * Factor 3: Time-of-Day Pattern (0-100)
- * Do historical attacks tend to happen at this time of day?
- * Looks at ±2 hour window from current Israel time.
- * Now operates on deduplicated events (not raw alerts).
- */
-function scoreTimePattern(events: { alert_datetime: string; city_count: number }[], currentIsraelHour: number): number {
-  if (events.length === 0) return 0;
-
-  // Count events in ±2h window vs total
-  const windowHours = new Set<number>();
-  for (let h = currentIsraelHour - 2; h <= currentIsraelHour + 2; h++) {
-    windowHours.add(((h % 24) + 24) % 24);
-  }
-
-  let inWindow = 0;
-  for (const e of events) {
-    if (windowHours.has(getIsraelHour(new Date(e.alert_datetime)))) inWindow++;
-  }
-
-  // What fraction of events happen in this time window?
-  // 5/24 = ~21% would be expected by chance
-  const fraction = inWindow / events.length;
-  const expectedFraction = 5 / 24; // 5 hours out of 24
-
-  if (fraction <= expectedFraction) return Math.round(fraction / expectedFraction * 30); // Below average: 0-30
-  // Above average: 30-100, scaled by how much above expected
-  return Math.round(30 + 70 * Math.min(1, (fraction - expectedFraction) / (0.5 - expectedFraction)));
-}
-
-/**
- * Factor 4: Trend / Escalation (0-100)
- * Is the attack rate increasing or decreasing?
- * Compares last 24h to previous 48h (the 24-72h window).
- * Now operates on deduplicated events (not raw alerts).
- */
-function scoreTrend(events: { alert_datetime: string; city_count: number }[], nowMs: number): { score: number; direction: string } {
-  const last24h = events.filter(e => nowMs - new Date(e.alert_datetime).getTime() < 24 * 60 * 60 * 1000);
-  const prev48h = events.filter(e => {
-    const age = nowMs - new Date(e.alert_datetime).getTime();
-    return age >= 24 * 60 * 60 * 1000 && age < 72 * 60 * 60 * 1000;
-  });
-
-  const recentRate = last24h.length / 1; // events per day (last 1 day)
-  const olderRate = prev48h.length / 2;  // events per day (2-day window)
-
-  if (olderRate === 0 && recentRate === 0) return { score: 0, direction: 'stable' };
-  if (olderRate === 0 && recentRate > 0) return { score: 85, direction: 'rising' }; // New escalation
-
-  const ratio = recentRate / olderRate;
-
-  let direction = 'stable';
-  if (ratio > 1.5) direction = 'rising';
-  else if (ratio < 0.5) direction = 'falling';
-
-  // Score: ratio of 2x+ = 100, 1x = 50, 0x = 0
-  const score = Math.min(100, Math.max(0, ratio * 50));
-  return { score, direction };
-}
-
-/**
- * Factor 5: Regional Spillover (0-100)
- * Are neighboring regions experiencing alerts?
- * If your neighbors are getting hit, you're more likely to be next.
- * Now operates on deduplicated events (not raw alerts).
- */
-function scoreRegionalSpill(
+function extractFeatures(
+  regionEvents: AlertEvent[],
+  allEvents: Record<string, AlertEvent[]>,
   regionSlug: string,
-  allEventsByRegion: Record<string, { alert_datetime: string; city_count: number }[]>,
-  nowMs: number
-): number {
-  const neighbors = NEIGHBORS[regionSlug] ?? [];
-  if (neighbors.length === 0) return 0;
+  atMs: number,
+): number[] {
+  let c1h = 0, c3h = 0, c6h = 0, c24h = 0;
+  let minAge = Infinity;
+  let prev3hCount = 0;
+  let spreadSum = 0, spreadN = 0;
 
-  let neighborScore = 0;
-  for (const n of neighbors) {
-    const nEvents = allEventsByRegion[n] ?? [];
-    // Count events in last 6h from this neighbor
-    const recentCount = nEvents.filter(
-      e => nowMs - new Date(e.alert_datetime).getTime() < 6 * 60 * 60 * 1000
-    ).length;
+  for (const e of regionEvents) {
+    const age = atMs - e.ts;
+    if (age < 0) continue;          // future event — skip
+    if (age > 7 * DAY_MS) continue; // too old
 
-    if (recentCount > 0) {
-      // Each active neighbor contributes, diminishing returns
-      neighborScore += Math.min(40, recentCount * 8);
+    if (age < HOUR_MS) c1h++;
+    if (age < 3 * HOUR_MS) { c3h++; spreadSum += e.city_count; spreadN++; }
+    if (age < 6 * HOUR_MS) c6h++;
+    if (age < DAY_MS) c24h++;
+    if (age >= 3 * HOUR_MS && age < 6 * HOUR_MS) prev3hCount++;
+    if (age < minAge) minAge = age;
+  }
+
+  // Neighbor activity in last 3h
+  let neighborCount = 0;
+  for (const n of (NEIGHBORS[regionSlug] ?? [])) {
+    for (const e of (allEvents[n] ?? [])) {
+      const age = atMs - e.ts;
+      if (age >= 0 && age < 3 * HOUR_MS) neighborCount++;
     }
   }
 
-  return Math.min(100, neighborScore);
+  const hour = getIsraelHour(atMs);
+  const minutesSinceLast = minAge === Infinity ? 1440 : minAge / 60_000;
+
+  return [
+    Math.log1p(c1h)  / 4,                                       // 0
+    Math.log1p(c3h)  / 5,                                       // 1
+    Math.log1p(c6h)  / 5.5,                                     // 2
+    Math.log1p(c24h) / 6,                                       // 3
+    1 - Math.min(1, minutesSinceLast / 1440),                    // 4
+    Math.sin(2 * Math.PI * hour / 24),                           // 5
+    Math.cos(2 * Math.PI * hour / 24),                           // 6
+    Math.log1p(neighborCount) / 5,                               // 7
+    prev3hCount === 0
+      ? (c3h > 0 ? 1 : 0)
+      : Math.min(1, (c3h / prev3hCount) / 2),                   // 8
+    spreadN === 0 ? 0 : Math.min(1, (spreadSum / spreadN) / 20),// 9
+  ];
 }
+
+// ============================================================
+// Logistic Regression — pure TypeScript, zero dependencies
+// ============================================================
+
+interface Sample { x: number[]; y: number }
+
+class LogisticRegression {
+  w: number[];
+  b: number;
+
+  constructor(dim: number) {
+    this.w = Array(dim).fill(0).map(() => (Math.random() - 0.5) * 0.1);
+    this.b = 0;
+  }
+
+  private sigmoid(z: number): number {
+    if (z >  500) return 1;
+    if (z < -500) return 0;
+    return 1 / (1 + Math.exp(-z));
+  }
+
+  predict(x: number[]): number {
+    let z = this.b;
+    for (let i = 0; i < this.w.length; i++) z += this.w[i] * x[i];
+    return this.sigmoid(z);
+  }
+
+  /**
+   * Train with mini-batch SGD + L2 regularisation.
+   * Returns { loss, accuracy } on the training set.
+   */
+  train(
+    data: Sample[],
+    { epochs = 120, batchSize = 32, lr = 0.15, lambda = 0.01 } = {},
+  ): { loss: number; accuracy: number } {
+    if (data.length === 0) return { loss: 0, accuracy: 0 };
+
+    let currentLr = lr;
+    for (let ep = 0; ep < epochs; ep++) {
+      // Fisher–Yates shuffle
+      const idx = data.map((_, i) => i);
+      for (let i = idx.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [idx[i], idx[j]] = [idx[j], idx[i]];
+      }
+
+      for (let start = 0; start < idx.length; start += batchSize) {
+        const end = Math.min(start + batchSize, idx.length);
+        const n = end - start;
+        const gW = new Float64Array(this.w.length);
+        let gB = 0;
+
+        for (let k = start; k < end; k++) {
+          const s = data[idx[k]];
+          const err = this.predict(s.x) - s.y;
+          for (let j = 0; j < this.w.length; j++) gW[j] += err * s.x[j];
+          gB += err;
+        }
+
+        for (let j = 0; j < this.w.length; j++) {
+          this.w[j] -= currentLr * (gW[j] / n + lambda * this.w[j]);
+        }
+        this.b -= currentLr * gB / n;
+      }
+
+      if (ep > 0 && ep % 30 === 0) currentLr *= 0.75;
+    }
+
+    return this.evaluate(data);
+  }
+
+  evaluate(data: Sample[]): { loss: number; accuracy: number } {
+    let loss = 0, correct = 0;
+    const eps = 1e-7;
+    for (const s of data) {
+      const p = this.predict(s.x);
+      loss -= s.y * Math.log(p + eps) + (1 - s.y) * Math.log(1 - p + eps);
+      if ((p >= 0.5) === (s.y === 1)) correct++;
+    }
+    return { loss: loss / data.length, accuracy: correct / data.length };
+  }
+}
+
+// ============================================================
+// Training Data Generation (sliding window)
+// ============================================================
+
+function buildSamples(
+  regionSlug: string,
+  regionEvents: AlertEvent[],
+  allEvents: Record<string, AlertEvent[]>,
+  fromMs: number,
+  toMs: number,
+): Sample[] {
+  const samples: Sample[] = [];
+
+  for (let t = fromMs; t < toMs - PREDICTION_WINDOW_MS; t += WINDOW_STEP_MS) {
+    const x = extractFeatures(regionEvents, allEvents, regionSlug, t);
+
+    // Label: any event in the next PREDICTION_WINDOW?
+    const y = regionEvents.some(e => e.ts > t && e.ts <= t + PREDICTION_WINDOW_MS) ? 1 : 0;
+    samples.push({ x, y });
+  }
+  return samples;
+}
+
+/**
+ * Balance dataset: undersample majority class to max 2.5:1 ratio.
+ * This prevents the model from always predicting "no alert".
+ */
+function balanceData(data: Sample[]): Sample[] {
+  const pos = data.filter(s => s.y === 1);
+  const neg = data.filter(s => s.y === 0);
+
+  if (pos.length === 0) return data;                // no positives → nothing to balance
+  if (neg.length <= pos.length * 2.5) return data;  // already balanced enough
+
+  // Shuffle negatives and take 2.5× positives
+  const shuffled = neg.sort(() => Math.random() - 0.5);
+  return [...pos, ...shuffled.slice(0, Math.ceil(pos.length * 2.5))];
+}
+
+// ============================================================
+// Main Pipeline
+// ============================================================
 
 async function calculateAll() {
   const now = new Date();
   const nowMs = now.getTime();
-  console.log(`[${now.toISOString()}] Calculating probabilities (improved model v2)...`);
+  console.log(`[${now.toISOString()}] ML Probability v3 — Logistic Regression\n`);
 
-  // Determine data window: use current conflict start date if set, else 30-day rolling
-  const thirtyDaysAgo = new Date(nowMs - 30 * 24 * 60 * 60 * 1000);
-  const dataStartDate = CURRENT_CONFLICT_START
-    ? new Date(Math.max(CURRENT_CONFLICT_START.getTime(), thirtyDaysAgo.getTime()))
-    : thirtyDaysAgo;
+  // ── Fetch ALL alerts (paginated — Supabase defaults to 1000) ──
+  const alerts: Array<{ region_slug: string; alert_datetime: string }> = [];
+  const PAGE_SIZE = 1000; // Supabase caps at 1000 per request
+  let offset = 0;
+  let fetchError: string | null = null;
 
-  console.log(`  Data window: ${dataStartDate.toISOString()} → now`);
-  if (CURRENT_CONFLICT_START) {
-    console.log(`  (Using CURRENT_CONFLICT_START: ${CURRENT_CONFLICT_START.toISOString()})`);
+  while (true) {
+    const { data, error } = await db
+      .from('alerts')
+      .select('region_slug, alert_datetime')
+      .order('alert_datetime', { ascending: true })
+      .range(offset, offset + PAGE_SIZE - 1);
+
+    if (error) { fetchError = error.message; break; }
+    if (!data || data.length === 0) break;
+    alerts.push(...data);
+    if (data.length < PAGE_SIZE) break; // last page
+    offset += PAGE_SIZE;
   }
 
-  const { data: alerts, error } = await db
-    .from('alerts')
-    .select('*')
-    .gte('alert_datetime', dataStartDate.toISOString())
-    .order('alert_datetime', { ascending: false });
-
-  if (error) {
-    console.error('Failed to fetch alerts:', error.message);
-    process.exit(1);
+  if (fetchError) { console.error('DB error:', fetchError); process.exit(1); }
+  if (alerts.length === 0) {
+    console.log('No alerts in DB — writing zero snapshots');
+    await db.from('probability_snapshots').insert(
+      REGIONS.map(r => ({
+        region_slug: r, calculated_at: now.toISOString(),
+        probability_score: 0, alert_count_24h: 0, alert_count_7d: 0,
+        trend_direction: 'stable', has_active_alert: false,
+      }))
+    );
+    return;
   }
 
-  console.log(`Found ${alerts?.length ?? 0} alerts since ${dataStartDate.toISOString().split('T')[0]}`);
+  console.log(`Loaded ${alerts.length} alerts`);
 
-  // Group alerts by region
-  const alertsByRegion: Record<string, any[]> = {};
-  for (const r of REGIONS) alertsByRegion[r] = [];
-  for (const a of alerts ?? []) {
-    if (alertsByRegion[a.region_slug]) {
-      alertsByRegion[a.region_slug].push(a);
+  // ── Group & deduplicate ───────────────────────────────────
+  const rawByRegion: Record<string, any[]> = {};
+  for (const r of REGIONS) rawByRegion[r] = [];
+  for (const a of alerts) {
+    if (rawByRegion[a.region_slug]) rawByRegion[a.region_slug].push(a);
+  }
+
+  const eventsByRegion: Record<string, AlertEvent[]> = {};
+  for (const r of REGIONS) eventsByRegion[r] = deduplicateAlerts(rawByRegion[r]);
+
+  // ── Data range ────────────────────────────────────────────
+  const dataStartMs = Math.min(...alerts.map(a => new Date(a.alert_datetime).getTime()));
+  const trainCutoff = nowMs - 3 * HOUR_MS; // hold out last 3h for validation
+
+  console.log(`Data: ${new Date(dataStartMs).toISOString()} → ${now.toISOString()}`);
+  console.log(`Train cutoff: ${new Date(trainCutoff).toISOString()}\n`);
+
+  // ── Per-region: train, validate, predict ──────────────────
+  const snapshots = [];
+
+  for (const region of REGIONS) {
+    const events = eventsByRegion[region];
+    const rawAlerts = rawByRegion[region];
+
+    // Training set: start 24h in (so features have look-back history)
+    const trainFrom = dataStartMs + DAY_MS;
+    const trainSamples = buildSamples(region, events, eventsByRegion, trainFrom, trainCutoff);
+    const balanced = balanceData(trainSamples);
+
+    // Validation set: last 3h
+    const validSamples = buildSamples(region, events, eventsByRegion, trainCutoff, nowMs);
+
+    // Count class distribution
+    const posCount = trainSamples.filter(s => s.y === 1).length;
+    const negCount = trainSamples.filter(s => s.y === 0).length;
+
+    // Train
+    const model = new LogisticRegression(NUM_FEATURES);
+    const trainMetrics = model.train(balanced, { epochs: 150, batchSize: 32, lr: 0.15, lambda: 0.01 });
+    const validMetrics = validSamples.length > 0 ? model.evaluate(validSamples) : null;
+
+    // ── Predict NOW ───────────────────────────────────────
+    const currentX = extractFeatures(events, eventsByRegion, region, nowMs);
+    let prob = model.predict(currentX) * 100;
+
+    // ── Stats for snapshot ────────────────────────────────
+    const alertsLast24h = rawAlerts.filter(a => nowMs - new Date(a.alert_datetime).getTime() < DAY_MS);
+    const alertsLast7d  = rawAlerts.filter(a => nowMs - new Date(a.alert_datetime).getTime() < 7 * DAY_MS);
+    const hasActive     = rawAlerts.some(a => nowMs - new Date(a.alert_datetime).getTime() < 5 * 60_000);
+
+    // Trend
+    const ev24h = events.filter(e => nowMs - e.ts < DAY_MS).length;
+    const evPrev24h = events.filter(e => {
+      const age = nowMs - e.ts;
+      return age >= DAY_MS && age < 2 * DAY_MS;
+    }).length;
+    let trend = 'stable';
+    if (evPrev24h > 0) {
+      if (ev24h / evPrev24h > 1.5) trend = 'rising';
+      else if (ev24h / evPrev24h < 0.5) trend = 'falling';
+    } else if (ev24h > 0) { trend = 'rising'; }
+
+    // ── Active-alert overrides ────────────────────────────
+    if (hasActive) {
+      prob = Math.max(prob, 95);
+      if (prob >= 95) prob = 100;
+    } else {
+      prob = Math.min(prob, 98);
+    }
+    const score = Math.round(prob);
+
+    snapshots.push({
+      region_slug: region,
+      calculated_at: now.toISOString(),
+      probability_score: score,
+      alert_count_24h: alertsLast24h.length,
+      alert_count_7d: alertsLast7d.length,
+      trend_direction: trend,
+      has_active_alert: hasActive,
+    });
+
+    // ── Self-check log ────────────────────────────────────
+    const vAcc = validMetrics ? `${(validMetrics.accuracy * 100).toFixed(0)}%` : 'n/a';
+    console.log(
+      `  ${region.padEnd(16)} ${String(score).padStart(3)}% | ` +
+      `train ${balanced.length} (${posCount}+/${negCount}-) acc=${(trainMetrics.accuracy * 100).toFixed(0)}% | ` +
+      `valid ${validSamples.length} acc=${vAcc} | ` +
+      `24h:${alertsLast24h.length} ev:${events.length}`,
+    );
+
+    // Log feature weights for interpretability
+    if (events.length > 0) {
+      const featureNames = ['count1h','count3h','count6h','count24h','recency','hourSin','hourCos','neighbor','trend','spread'];
+      const wStr = model.w.map((w, i) => `${featureNames[i]}=${w.toFixed(2)}`).join(' ');
+      console.log(`    weights: ${wStr} bias=${model.b.toFixed(2)}`);
     }
   }
 
-  // Deduplicate: group alerts within 2-min windows into single "events" per region
-  const eventsByRegion: Record<string, { alert_datetime: string; city_count: number }[]> = {};
-  for (const r of REGIONS) {
-    eventsByRegion[r] = deduplicateAlerts(alertsByRegion[r]);
-  }
+  // ── Insert snapshots ──────────────────────────────────────
+  const { error: insertErr } = await db.from('probability_snapshots').insert(snapshots);
+  if (insertErr) { console.error('Insert error:', insertErr.message); process.exit(1); }
 
-  const currentIsraelHour = getIsraelHour(now);
-  const snapshots = [];
+  console.log(`\nInserted ${snapshots.length} snapshots (ML v3)`);
 
-  for (const regionSlug of REGIONS) {
-    const regionAlerts = alertsByRegion[regionSlug];  // raw alerts (for stats & active check)
-    const regionEvents = eventsByRegion[regionSlug];  // deduplicated events (for scoring)
-
-    // Calculate each factor using deduplicated events
-    const recentActivity = scoreRecentActivity(regionEvents, nowMs);
-    const intensity = scoreIntensity(regionEvents, nowMs);
-    const timePattern = scoreTimePattern(regionEvents, currentIsraelHour);
-    const { score: trendScore, direction: trendDirection } = scoreTrend(regionEvents, nowMs);
-    const regionalSpill = scoreRegionalSpill(regionSlug, eventsByRegion, nowMs);
-
-    // Weighted combination
-    const rawScore =
-      W.recentActivity * recentActivity +
-      W.intensity * intensity +
-      W.timePattern * timePattern +
-      W.trend * trendScore +
-      W.regionalSpill * regionalSpill;
-
-    // Count stats
-    const oneDayAgo = nowMs - 24 * 60 * 60 * 1000;
-    const sevenDaysAgo = nowMs - 7 * 24 * 60 * 60 * 1000;
-    const fiveMinAgo = nowMs - 5 * 60 * 1000;
-    const alertsLast24h = regionAlerts.filter((a: any) => new Date(a.alert_datetime).getTime() >= oneDayAgo);
-    const alertsLast7d = regionAlerts.filter((a: any) => new Date(a.alert_datetime).getTime() >= sevenDaysAgo);
-    const hasActiveAlert = regionAlerts.some((a: any) => new Date(a.alert_datetime).getTime() >= fiveMinAgo);
-
-    // Final score: cap at 98% (100% only during active alert within 5 min)
-    let finalScore = Math.round(rawScore);
-    if (hasActiveAlert) finalScore = Math.max(finalScore, 95);
-    finalScore = Math.min(98, finalScore);
-    if (hasActiveAlert && recentActivity >= 98) finalScore = 100;
-
-    snapshots.push({
-      region_slug: regionSlug,
-      calculated_at: now.toISOString(),
-      probability_score: finalScore,
-      alert_count_24h: alertsLast24h.length,
-      alert_count_7d: alertsLast7d.length,
-      trend_direction: trendDirection,
-      has_active_alert: hasActiveAlert,
-    });
-
-    console.log(`  ${regionSlug}: ${finalScore}% [recent=${Math.round(recentActivity)} intensity=${Math.round(intensity)} time=${Math.round(timePattern)} trend=${Math.round(trendScore)}(${trendDirection}) spill=${Math.round(regionalSpill)}] alerts:${regionAlerts.length}→events:${regionEvents.length} 24h:${alertsLast24h.length} 7d:${alertsLast7d.length}`);
-  }
-
-  // Insert all snapshots
-  const { error: insertError } = await db.from('probability_snapshots').insert(snapshots);
-
-  if (insertError) {
-    console.error('Failed to insert snapshots:', insertError.message);
-    process.exit(1);
-  }
-
-  console.log(`\nInserted ${snapshots.length} probability snapshots`);
+  // ── Self-validation summary ───────────────────────────────
+  const highProb = snapshots.filter(s => s.probability_score >= 50);
+  const activeRegions = snapshots.filter(s => s.has_active_alert);
+  console.log(`\nSummary: ${highProb.length} regions >=50%, ${activeRegions.length} active alerts`);
 }
 
 calculateAll();
