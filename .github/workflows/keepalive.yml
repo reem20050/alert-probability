@@ -1,8 +1,8 @@
 name: Keepalive
-# Prevents GitHub from auto-disabling scheduled workflows
+# Prevents GitHub from auto-disabling scheduled workflows after 60 days
 on:
   schedule:
-    - cron: '0 0 1 * *'  # Monthly (1st day) - well within 60-day GitHub limit
+    - cron: '0 0 1 * *'  # Monthly (1st day)
   workflow_dispatch: {}
 
 jobs:
@@ -10,6 +10,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: write
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: gautamkrishnar/keepalive-workflow@v2
+      - name: Keep workflows alive
+        run: |
+          echo "Keepalive ping at $(date -u)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "ci: keepalive [skip ci]"
+          git push
