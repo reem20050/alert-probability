@@ -8,7 +8,7 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import type { Metadata } from 'next';
 
-export const revalidate = 900; // 15 minutes
+export const revalidate = 60; // 1 minute
 
 export async function generateStaticParams() {
   return getAllRegionSlugs().map((slug) => ({ slug }));

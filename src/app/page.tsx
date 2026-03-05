@@ -5,7 +5,7 @@ import ActiveAlertBanner from '@/components/ActiveAlertBanner';
 import LastUpdateTimer from '@/components/LastUpdateTimer';
 import type { RegionProbability, ProbabilitySnapshot } from '@/types';
 
-export const revalidate = 900; // 15 minutes
+export const revalidate = 60; // 1 minute
 
 async function getLatestProbabilities(): Promise<RegionProbability[]> {
   const { data, error } = await supabase
