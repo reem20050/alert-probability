@@ -5,6 +5,13 @@ const REGIONS = [
   'galilee', 'jerusalem', 'gaza-envelope', 'judea-samaria', 'eilat-arava'
 ];
 
+/**
+ * Current conflict start date — train the model ONLY on data from this war.
+ * Update this when a new conflict phase begins or after a significant ceasefire.
+ * Set to null to use the default 30-day rolling window instead.
+ */
+const CURRENT_CONFLICT_START = new Date('2025-10-01T00:00:00+02:00');
+
 // Regional adjacency map for spillover scoring
 const NEIGHBORS: Record<string, string[]> = {
   'gush-dan':       ['sharon', 'shfela', 'jerusalem'],
@@ -225,13 +232,21 @@ async function calculateAll() {
   const nowMs = now.getTime();
   console.log(`[${now.toISOString()}] Calculating probabilities (improved model v2)...`);
 
-  // Fetch all alerts from last 30 days for comprehensive analysis
+  // Determine data window: use current conflict start date if set, else 30-day rolling
   const thirtyDaysAgo = new Date(nowMs - 30 * 24 * 60 * 60 * 1000);
+  const dataStartDate = CURRENT_CONFLICT_START
+    ? new Date(Math.max(CURRENT_CONFLICT_START.getTime(), thirtyDaysAgo.getTime()))
+    : thirtyDaysAgo;
+
+  console.log(`  Data window: ${dataStartDate.toISOString()} → now`);
+  if (CURRENT_CONFLICT_START) {
+    console.log(`  (Using CURRENT_CONFLICT_START: ${CURRENT_CONFLICT_START.toISOString()})`);
+  }
 
   const { data: alerts, error } = await db
     .from('alerts')
     .select('*')
-    .gte('alert_datetime', thirtyDaysAgo.toISOString())
+    .gte('alert_datetime', dataStartDate.toISOString())
     .order('alert_datetime', { ascending: false });
 
   if (error) {
@@ -239,7 +254,7 @@ async function calculateAll() {
     process.exit(1);
   }
 
-  console.log(`Found ${alerts?.length ?? 0} alerts in last 30 days`);
+  console.log(`Found ${alerts?.length ?? 0} alerts since ${dataStartDate.toISOString().split('T')[0]}`);
 
   // Group alerts by region
   const alertsByRegion: Record<string, any[]> = {};
