@@ -1,4 +1,5 @@
 name: Keepalive
+# Prevents GitHub from auto-disabling scheduled workflows
 on:
   schedule:
     - cron: '0 0 1 * *'  # Monthly (1st day) - well within 60-day GitHub limit

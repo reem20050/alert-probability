@@ -1,4 +1,5 @@
 name: Calculate Probability
+# Recalculates alert probability scores
 on:
   schedule:
     - cron: '*/15 * * * *'  # Every 15 minutes
