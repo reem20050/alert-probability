@@ -41,9 +41,10 @@ function formatDate(d: Date): string {
 
 async function seed() {
   const now = new Date();
-  const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  // Start from the current conflict (Iran war) — October 2025
+  const CURRENT_CONFLICT_START = new Date('2025-10-01T00:00:00+02:00');
 
-  console.log(`[${now.toISOString()}] Seeding alerts from ${formatDate(thirtyDaysAgo)} to ${formatDate(now)}...`);
+  console.log(`[${now.toISOString()}] Seeding alerts from ${formatDate(CURRENT_CONFLICT_START)} to ${formatDate(now)}...`);
 
   // Fetch in 5-day chunks to avoid oversized responses
   const CHUNK_DAYS = 5;
@@ -52,7 +53,7 @@ async function seed() {
   let totalAlerts = 0;
   const unmappedAreas = new Set<string>();
 
-  let chunkStart = new Date(thirtyDaysAgo);
+  let chunkStart = new Date(CURRENT_CONFLICT_START);
 
   while (chunkStart < now) {
     const chunkEnd = new Date(Math.min(chunkStart.getTime() + CHUNK_DAYS * 24 * 60 * 60 * 1000, now.getTime()));
