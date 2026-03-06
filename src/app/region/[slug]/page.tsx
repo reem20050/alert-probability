@@ -51,22 +51,36 @@ async function getRegionData(slug: string) {
       .select('*')
       .eq('region_slug', slug)
       .gte('alert_datetime', sevenDaysAgo)
-      .order('alert_datetime', { ascending: false })
-      .limit(50),
+      .order('alert_datetime', { ascending: true }),
   ]);
 
+  // Deduplicate city alerts into events (barrages) for the heatmap.
+  // Alerts within a 2-minute gap are ONE event — same logic as
+  // scripts/calculate-probability.ts deduplicateIntoEvents().
+  const allAlerts = alertsRes.data ?? [];
+  const sortedTimestamps = allAlerts
+    .map((a: Record<string, unknown>) => new Date(a.alert_datetime as string).getTime())
+    .sort((a: number, b: number) => a - b);
+
+  const eventTimestamps: number[] = [];
+  for (let i = 0; i < sortedTimestamps.length; i++) {
+    if (i === 0 || sortedTimestamps[i] - sortedTimestamps[i - 1] > 2 * 60_000) {
+      eventTimestamps.push(sortedTimestamps[i]);
+    }
+  }
+
+  // Count events per Israel-time hour (NOT raw city alerts)
   const hourlyCounts = new Array(24).fill(0);
-  alertsRes.data?.forEach((a: Record<string, unknown>) => {
-    const d = new Date(a.alert_datetime as string);
+  for (const ts of eventTimestamps) {
     const israelHour = parseInt(
-      d.toLocaleString('en-US', {
+      new Date(ts).toLocaleString('en-US', {
         timeZone: 'Asia/Jerusalem',
         hour: 'numeric',
         hour12: false,
       })
     );
     hourlyCounts[israelHour]++;
-  });
+  }
 
   return {
     current: latestRes.data,
