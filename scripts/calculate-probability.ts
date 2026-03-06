@@ -1,7 +1,7 @@
 import { db } from './db';
 
 // ============================================================
-// Simple Empirical Probability — v4
+// Simple Empirical Probability — v5 (event-based counting)
 //
 // P = baseRate × hourMultiplier × momentumMultiplier
 //
@@ -25,7 +25,13 @@ const DAY_MS = 86_400_000;
 const HOUR_MS = 3_600_000;
 
 // ============================================================
-// Alert Event Deduplication — 2-minute window grouping
+// Alert Event Deduplication
+//
+// Each DB row = one city alert.  A single rocket barrage
+// triggers alerts across MANY cities at once.  We must NOT
+// count each city — we count *events* (barrages).
+//
+// An "event" = a cluster of alerts separated by > 2 minutes.
 // ============================================================
 
 interface AlertRow {
@@ -33,13 +39,35 @@ interface AlertRow {
   alert_datetime: string;
 }
 
+/**
+ * Group region alerts into events (barrages).
+ * Alerts within a 2-minute gap are ONE event.
+ * Returns sorted array of event timestamps (ms).
+ */
+function deduplicateIntoEvents(alerts: AlertRow[]): number[] {
+  if (alerts.length === 0) return [];
+
+  const timestamps = alerts
+    .map(a => new Date(a.alert_datetime).getTime())
+    .sort((a, b) => a - b);
+
+  const events: number[] = [timestamps[0]];
+  for (let i = 1; i < timestamps.length; i++) {
+    if (timestamps[i] - timestamps[i - 1] > 2 * 60_000) {
+      events.push(timestamps[i]);
+    }
+  }
+  return events;
+}
+
+/**
+ * For base rate: count unique 15-min windows that had ≥1 alert.
+ */
 function deduplicateIntoWindows(alerts: AlertRow[]): number[] {
-  // Returns array of timestamps (ms), one per 15-min window that had ≥1 alert
   if (alerts.length === 0) return [];
   const windows = new Set<number>();
   for (const a of alerts) {
     const ts = new Date(a.alert_datetime).getTime();
-    // Round down to 15-min window
     const windowStart = ts - (ts % (15 * 60_000));
     windows.add(windowStart);
   }
@@ -77,19 +105,19 @@ function calculateBaseRate(
 // ============================================================
 
 function calculateHourMultiplier(
-  regionAlerts: AlertRow[],
+  regionEvents: number[],          // already-deduplicated event timestamps
   currentHourIsrael: number,
 ): number {
-  if (regionAlerts.length === 0) return 0.1;
+  if (regionEvents.length === 0) return 0.1;
 
-  // Count alerts per hour (Israel time)
+  // Count events per hour (Israel time) — NOT individual city alerts
   const hourCounts = new Array(24).fill(0);
-  for (const a of regionAlerts) {
-    const h = getIsraelHour(new Date(a.alert_datetime).getTime());
+  for (const ts of regionEvents) {
+    const h = getIsraelHour(ts);
     hourCounts[h]++;
   }
 
-  const avgPerHour = regionAlerts.length / 24;
+  const avgPerHour = regionEvents.length / 24;
   if (avgPerHour === 0) return 0.1;
 
   // Smoothed window: [h-1, h, h+1]
@@ -139,29 +167,26 @@ function calculateMomentumMultiplier(
 // ============================================================
 
 function calculateTrend(
-  regionAlerts: AlertRow[],
+  regionEvents: number[],          // already-deduplicated event timestamps
   nowMs: number,
 ): 'rising' | 'falling' | 'stable' {
   const oneDayAgo = nowMs - DAY_MS;
   const twoDaysAgo = nowMs - 2 * DAY_MS;
   const sevenDaysAgo = nowMs - 7 * DAY_MS;
 
-  const alertsLast24h = regionAlerts.filter(
-    a => new Date(a.alert_datetime).getTime() >= oneDayAgo,
+  // Count EVENTS, not individual city alerts
+  const eventsLast24h = regionEvents.filter(ts => ts >= oneDayAgo).length;
+  const eventsDays2to7 = regionEvents.filter(
+    ts => ts >= sevenDaysAgo && ts < twoDaysAgo,
   ).length;
 
-  const alertsDays2to7 = regionAlerts.filter(a => {
-    const ts = new Date(a.alert_datetime).getTime();
-    return ts >= sevenDaysAgo && ts < twoDaysAgo;
-  }).length;
-
-  const recentRate = alertsLast24h; // per 1 day
-  const olderRate = alertsDays2to7 / 5; // per day average over 5 days
+  const recentRate = eventsLast24h; // per 1 day
+  const olderRate = eventsDays2to7 / 5; // per day average over 5 days
 
   if (olderRate > 0) {
     if (recentRate > olderRate * 1.3) return 'rising';
     if (recentRate < olderRate * 0.7) return 'falling';
-  } else if (alertsLast24h > 0) {
+  } else if (eventsLast24h > 0) {
     return 'rising';
   }
 
@@ -177,7 +202,7 @@ async function calculateAll() {
   const nowMs = now.getTime();
   const currentHourIsrael = getIsraelHour(nowMs);
 
-  console.log(`[${now.toISOString()}] Simple Empirical Probability v4`);
+  console.log(`[${now.toISOString()}] Simple Empirical Probability v5 (event-based counting)`);
   console.log(`  Israel hour: ${currentHourIsrael}:00\n`);
 
   // ── Fetch ALL alerts (paginated — Supabase caps at 1000) ──
@@ -233,13 +258,13 @@ async function calculateAll() {
   for (const region of REGIONS) {
     const regionAlerts = alertsByRegion[region];
 
-    // Count stats
-    const alertsLast24h = regionAlerts.filter(
-      a => nowMs - new Date(a.alert_datetime).getTime() < DAY_MS,
-    );
-    const alertsLast7d = regionAlerts.filter(
-      a => nowMs - new Date(a.alert_datetime).getTime() < 7 * DAY_MS,
-    );
+    // Deduplicate city alerts into events (barrages)
+    // Alerts within 2 min of each other = 1 event
+    const regionEvents = deduplicateIntoEvents(regionAlerts);
+
+    // Count event-based stats (NOT per-city)
+    const eventsLast24h = regionEvents.filter(ts => nowMs - ts < DAY_MS).length;
+    const eventsLast7d = regionEvents.filter(ts => nowMs - ts < 7 * DAY_MS).length;
     const hasActive = regionAlerts.some(
       a => nowMs - new Date(a.alert_datetime).getTime() < 5 * 60_000,
     );
@@ -250,12 +275,12 @@ async function calculateAll() {
         region_slug: region,
         calculated_at: now.toISOString(),
         probability_score: 100,
-        alert_count_24h: alertsLast24h.length,
-        alert_count_7d: alertsLast7d.length,
+        alert_count_24h: eventsLast24h,
+        alert_count_7d: eventsLast7d,
         trend_direction: 'rising' as const,
         has_active_alert: true,
       });
-      console.log(`  ${region.padEnd(16)} 100% 🔴 ACTIVE ALERT`);
+      console.log(`  ${region.padEnd(16)} 100% 🔴 ACTIVE ALERT (${regionAlerts.length} city alerts → ${regionEvents.length} events)`);
       continue;
     }
 
@@ -277,9 +302,9 @@ async function calculateAll() {
     // ── Calculate 3 components ──
     const windows = deduplicateIntoWindows(regionAlerts);
     const baseRate = calculateBaseRate(windows.length, totalWindowsSinceWarStart);
-    const hourMult = calculateHourMultiplier(regionAlerts, currentHourIsrael);
+    const hourMult = calculateHourMultiplier(regionEvents, currentHourIsrael);
     const momentum = calculateMomentumMultiplier(regionAlerts, nowMs);
-    const trend = calculateTrend(regionAlerts, nowMs);
+    const trend = calculateTrend(regionEvents, nowMs);
 
     // P = baseRate × hourMultiplier × momentumMultiplier
     let rawScore = baseRate * hourMult * momentum;
@@ -288,7 +313,7 @@ async function calculateAll() {
     rawScore = Math.min(95, rawScore);
 
     // Override O4: Floor at 1 if attacked in last 7 days
-    if (rawScore < 1 && alertsLast7d.length > 0) {
+    if (rawScore < 1 && eventsLast7d > 0) {
       rawScore = 1;
     }
 
@@ -298,8 +323,8 @@ async function calculateAll() {
       region_slug: region,
       calculated_at: now.toISOString(),
       probability_score: score,
-      alert_count_24h: alertsLast24h.length,
-      alert_count_7d: alertsLast7d.length,
+      alert_count_24h: eventsLast24h,
+      alert_count_7d: eventsLast7d,
       trend_direction: trend,
       has_active_alert: false,
     });
@@ -308,7 +333,7 @@ async function calculateAll() {
     console.log(
       `  ${region.padEnd(16)} ${String(score).padStart(3)}% | ` +
       `base=${baseRate.toFixed(2)}% hour×${hourMult.toFixed(2)} mom×${momentum.toFixed(1)} | ` +
-      `24h:${alertsLast24h.length} 7d:${alertsLast7d.length} windows:${windows.length} | ` +
+      `24h:${eventsLast24h} 7d:${eventsLast7d} events:${regionEvents.length} (from ${regionAlerts.length} city alerts) | ` +
       `trend:${trend}`,
     );
   }
@@ -317,7 +342,7 @@ async function calculateAll() {
   const { error: insertErr } = await db.from('probability_snapshots').insert(snapshots);
   if (insertErr) { console.error('Insert error:', insertErr.message); process.exit(1); }
 
-  console.log(`\nInserted ${snapshots.length} snapshots (Empirical v4)`);
+  console.log(`\nInserted ${snapshots.length} snapshots (Empirical v5 — event-based)`);
 
   // ── Summary ──
   const highProb = snapshots.filter(s => s.probability_score >= 50);

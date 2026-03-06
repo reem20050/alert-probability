@@ -3,8 +3,10 @@ import type { Alert, ProbabilitySnapshot } from '@/types';
 // ============================================================
 // Simple Empirical Probability — SSR fallback
 //
-// Same algorithm as scripts/calculate-probability.ts (v4)
+// Same algorithm as scripts/calculate-probability.ts (v5)
 // P = baseRate × hourMultiplier × momentumMultiplier
+//
+// Counts EVENTS (barrages), not individual city alerts.
 // ============================================================
 
 interface ProbabilityInput {
@@ -39,19 +41,41 @@ function countUniqueWindows(alerts: Alert[]): number {
   return windows.size;
 }
 
+/**
+ * Deduplicate city alerts into events (barrages).
+ * Alerts within a 2-minute gap are ONE event.
+ * Returns sorted array of event timestamps (ms).
+ */
+function deduplicateIntoEvents(alerts: Alert[]): number[] {
+  if (alerts.length === 0) return [];
+
+  const timestamps = alerts
+    .map(a => new Date(a.alert_datetime).getTime())
+    .sort((a, b) => a - b);
+
+  const events: number[] = [timestamps[0]];
+  for (let i = 1; i < timestamps.length; i++) {
+    if (timestamps[i] - timestamps[i - 1] > 2 * 60_000) {
+      events.push(timestamps[i]);
+    }
+  }
+  return events;
+}
+
 function calculateHourMultiplier(
-  alerts: Alert[],
+  events: number[],                // already-deduplicated event timestamps
   currentHourIsrael: number,
 ): number {
-  if (alerts.length === 0) return 0.1;
+  if (events.length === 0) return 0.1;
 
+  // Count events per hour (Israel time) — NOT individual city alerts
   const hourCounts = new Array(24).fill(0);
-  for (const a of alerts) {
-    const h = getIsraelHour(new Date(a.alert_datetime).getTime());
+  for (const ts of events) {
+    const h = getIsraelHour(ts);
     hourCounts[h]++;
   }
 
-  const avgPerHour = alerts.length / 24;
+  const avgPerHour = events.length / 24;
   if (avgPerHour === 0) return 0.1;
 
   const window = [
@@ -94,12 +118,13 @@ export function calculateProbability(input: ProbabilityInput): Omit<ProbabilityS
   const nowMs = now.getTime();
   const alerts = input.alerts.filter(a => a.region_slug === input.regionSlug);
 
-  const oneDayAgo = new Date(nowMs - DAY_MS);
-  const sevenDaysAgo = new Date(nowMs - 7 * DAY_MS);
-  const twoDaysAgo = new Date(nowMs - 2 * DAY_MS);
+  // Deduplicate city alerts into events (barrages)
+  // Alerts within 2 min of each other = 1 event
+  const events = deduplicateIntoEvents(alerts);
 
-  const alertsLast24h = alerts.filter(a => new Date(a.alert_datetime) >= oneDayAgo);
-  const alertsLast7d = alerts.filter(a => new Date(a.alert_datetime) >= sevenDaysAgo);
+  // Event-based counts (NOT per-city)
+  const eventsLast24h = events.filter(ts => nowMs - ts < DAY_MS).length;
+  const eventsLast7d = events.filter(ts => nowMs - ts < 7 * DAY_MS).length;
 
   // Override O1: Active alert (within last 5 min) → 100%
   const fiveMinAgo = new Date(nowMs - 5 * 60_000);
@@ -110,8 +135,8 @@ export function calculateProbability(input: ProbabilityInput): Omit<ProbabilityS
       region_slug: input.regionSlug,
       calculated_at: now.toISOString(),
       probability_score: 100,
-      alert_count_24h: alertsLast24h.length,
-      alert_count_7d: alertsLast7d.length,
+      alert_count_24h: eventsLast24h,
+      alert_count_7d: eventsLast7d,
       trend_direction: 'rising',
       has_active_alert: true,
     };
@@ -132,17 +157,17 @@ export function calculateProbability(input: ProbabilityInput): Omit<ProbabilityS
 
   // ── Calculate 3 components ──
 
-  // Component 1: Base rate
+  // Component 1: Base rate (15-min windows)
   const hoursSinceWarStart = (nowMs - WAR_START_MS) / HOUR_MS;
   const totalWindows = Math.floor(hoursSinceWarStart * 4);
   const windowsWithAlerts = countUniqueWindows(alerts);
   const baseRate = totalWindows > 0 ? (windowsWithAlerts / totalWindows) * 100 : 0;
 
-  // Component 2: Hour multiplier
+  // Component 2: Hour multiplier (uses events, not city alerts)
   const currentHourIsrael = getIsraelHour(nowMs);
-  const hourMult = calculateHourMultiplier(alerts, currentHourIsrael);
+  const hourMult = calculateHourMultiplier(events, currentHourIsrael);
 
-  // Component 3: Momentum multiplier
+  // Component 3: Momentum multiplier (uses raw alerts for most-recent timestamp)
   const momentum = calculateMomentumMultiplier(alerts, nowMs);
 
   // P = baseRate × hourMult × momentum
@@ -152,22 +177,28 @@ export function calculateProbability(input: ProbabilityInput): Omit<ProbabilityS
   rawScore = Math.min(95, rawScore);
 
   // Override O4: Floor at 1 if attacked in last 7 days
-  if (rawScore < 1 && alertsLast7d.length > 0) {
+  if (rawScore < 1 && eventsLast7d > 0) {
     rawScore = 1;
   }
 
   const probability_score = Math.round(rawScore);
 
-  // Trend direction
-  const alertsDays2to7 = alertsLast7d.filter(a => new Date(a.alert_datetime) < twoDaysAgo);
-  const recentRate = alertsLast24h.length;
-  const olderRate = alertsDays2to7.length / 5;
+  // Trend direction (event-based)
+  const oneDayAgo = nowMs - DAY_MS;
+  const twoDaysAgo = nowMs - 2 * DAY_MS;
+  const sevenDaysAgo = nowMs - 7 * DAY_MS;
+
+  const eventsDays2to7 = events.filter(
+    ts => ts >= sevenDaysAgo && ts < twoDaysAgo,
+  ).length;
+  const recentRate = eventsLast24h;
+  const olderRate = eventsDays2to7 / 5;
 
   let trendDirection: 'rising' | 'falling' | 'stable' = 'stable';
   if (olderRate > 0) {
     if (recentRate > olderRate * 1.3) trendDirection = 'rising';
     else if (recentRate < olderRate * 0.7) trendDirection = 'falling';
-  } else if (alertsLast24h.length > 0) {
+  } else if (eventsLast24h > 0) {
     trendDirection = 'rising';
   }
 
@@ -175,8 +206,8 @@ export function calculateProbability(input: ProbabilityInput): Omit<ProbabilityS
     region_slug: input.regionSlug,
     calculated_at: now.toISOString(),
     probability_score,
-    alert_count_24h: alertsLast24h.length,
-    alert_count_7d: alertsLast7d.length,
+    alert_count_24h: eventsLast24h,
+    alert_count_7d: eventsLast7d,
     trend_direction: trendDirection,
     has_active_alert: false,
   };
