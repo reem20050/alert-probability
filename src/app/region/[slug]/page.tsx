@@ -29,12 +29,15 @@ export async function generateMetadata({
   };
 }
 
+// War start date — same as scripts/calculate-probability.ts
+const WAR_START = '2026-02-28T00:00:00+02:00';
+
 async function getRegionData(slug: string) {
   const sevenDaysAgo = new Date(
     Date.now() - 7 * 24 * 60 * 60 * 1000
   ).toISOString();
 
-  const [latestRes, trendRes, alertsRes] = await Promise.all([
+  const [latestRes, trendRes, recentAlertsRes] = await Promise.all([
     supabase
       .from('latest_probabilities')
       .select('*')
@@ -46,6 +49,7 @@ async function getRegionData(slug: string) {
       .eq('region_slug', slug)
       .gte('calculated_at', sevenDaysAgo)
       .order('calculated_at', { ascending: true }),
+    // Recent alerts — for the "recent alerts" list (last 7 days)
     supabase
       .from('alerts')
       .select('*')
@@ -54,18 +58,38 @@ async function getRegionData(slug: string) {
       .order('alert_datetime', { ascending: true }),
   ]);
 
+  // ── Fetch ALL alerts since war start for the hourly heatmap ──
+  // Paginated — Supabase caps at 1000 rows per request
+  const PAGE_SIZE = 1000;
+  const allAlertTimestamps: number[] = [];
+  let offset = 0;
+
+  while (true) {
+    const { data } = await supabase
+      .from('alerts')
+      .select('alert_datetime')
+      .eq('region_slug', slug)
+      .gte('alert_datetime', WAR_START)
+      .order('alert_datetime', { ascending: true })
+      .range(offset, offset + PAGE_SIZE - 1);
+
+    if (!data || data.length === 0) break;
+    for (const a of data) {
+      allAlertTimestamps.push(new Date(a.alert_datetime as string).getTime());
+    }
+    if (data.length < PAGE_SIZE) break; // last page
+    offset += PAGE_SIZE;
+  }
+
   // Deduplicate city alerts into events (barrages) for the heatmap.
   // Alerts within a 2-minute gap are ONE event — same logic as
   // scripts/calculate-probability.ts deduplicateIntoEvents().
-  const allAlerts = alertsRes.data ?? [];
-  const sortedTimestamps = allAlerts
-    .map((a: Record<string, unknown>) => new Date(a.alert_datetime as string).getTime())
-    .sort((a: number, b: number) => a - b);
+  allAlertTimestamps.sort((a, b) => a - b);
 
   const eventTimestamps: number[] = [];
-  for (let i = 0; i < sortedTimestamps.length; i++) {
-    if (i === 0 || sortedTimestamps[i] - sortedTimestamps[i - 1] > 2 * 60_000) {
-      eventTimestamps.push(sortedTimestamps[i]);
+  for (let i = 0; i < allAlertTimestamps.length; i++) {
+    if (i === 0 || allAlertTimestamps[i] - allAlertTimestamps[i - 1] > 2 * 60_000) {
+      eventTimestamps.push(allAlertTimestamps[i]);
     }
   }
 
@@ -89,7 +113,7 @@ async function getRegionData(slug: string) {
         time: t.calculated_at as string,
         score: t.probability_score as number,
       })) ?? [],
-    alerts: alertsRes.data ?? [],
+    alerts: recentAlertsRes.data ?? [],
     hourlyCounts,
   };
 }
@@ -170,7 +194,7 @@ export default async function RegionPage({
       {/* Hourly heatmap */}
       <div className="rounded-xl border border-gray-800 bg-gray-900/50 p-5 mb-6">
         <h3 className="text-lg font-semibold mb-4">
-          התפלגות שעתית של התרעות
+          התפלגות שעתית של אירועים (מתחילת המלחמה)
         </h3>
         <HourlyHeatmap hourlyCounts={data.hourlyCounts} />
       </div>

@@ -1,14 +1,20 @@
 import { db } from './db';
 
 // ============================================================
-// Simple Empirical Probability — v5 (event-based counting)
+// Simple Empirical Probability — v5.1 (max-base + softened multipliers)
 //
-// P = baseRate × hourMultiplier × momentumMultiplier
+// P = baseRate × soften(hourMultiplier) × soften(momentumMultiplier)
 //
 // Three intuitive components:
-// 1. Base rate:  how often does this region get alerts? (empirical %)
+// 1. Base rate:  max(recentRate, historicalRate) — responds to NOW
 // 2. Hour mult:  are alerts more/less likely at this hour? (time-of-day)
 // 3. Momentum:   has it been noisy or quiet recently? (recency state)
+//
+// v5.1 improvements over v5:
+// - Base rate uses max(recent 24h rate, historical rate) instead of
+//   only historical — prevents dilution over quiet days
+// - Sub-1 multipliers are softened with sqrt() to prevent
+//   excessive dampening when both multipliers are < 1
 //
 // No ML, no weights to tune. Pure counting and multiplication.
 // ============================================================
@@ -89,7 +95,25 @@ function getIsraelHour(ms: number): number {
 }
 
 // ============================================================
+// Soften sub-1 multipliers to prevent excessive dampening
+//
+// Problem: when hourMult=0.3 and momentum=0.7, multiplying
+// gives 0.21 — cutting base rate to 1/5th.  Too aggressive.
+//
+// Fix: sqrt() on sub-1 values.  0.3 → 0.55,  0.7 → 0.84
+// Above 1.0 the multiplier is kept as-is (boosting is fine).
+// ============================================================
+
+function softenMultiplier(mult: number): number {
+  if (mult >= 1.0) return mult;
+  return Math.sqrt(mult);
+}
+
+// ============================================================
 // Component 1: Base Rate (empirical frequency)
+//
+// v5.1: Use max(recentRate, historicalRate) so the score
+// responds to current activity, not just the long-term average.
 // ============================================================
 
 function calculateBaseRate(
@@ -202,7 +226,7 @@ async function calculateAll() {
   const nowMs = now.getTime();
   const currentHourIsrael = getIsraelHour(nowMs);
 
-  console.log(`[${now.toISOString()}] Simple Empirical Probability v5 (event-based counting)`);
+  console.log(`[${now.toISOString()}] Simple Empirical Probability v5.1 (max-base + softened multipliers)`);
   console.log(`  Israel hour: ${currentHourIsrael}:00\n`);
 
   // ── Fetch ALL alerts (paginated — Supabase caps at 1000) ──
@@ -301,13 +325,22 @@ async function calculateAll() {
 
     // ── Calculate 3 components ──
     const windows = deduplicateIntoWindows(regionAlerts);
-    const baseRate = calculateBaseRate(windows.length, totalWindowsSinceWarStart);
+    const historicalRate = calculateBaseRate(windows.length, totalWindowsSinceWarStart);
+
+    // v5.1: Recent rate — how active is this region RIGHT NOW?
+    // 96 = number of 15-min windows in 24 hours
+    const recentRate = (eventsLast24h / 96) * 100;
+
+    // Use whichever is higher — responds to current activity
+    const baseRate = Math.max(recentRate, historicalRate);
+
     const hourMult = calculateHourMultiplier(regionEvents, currentHourIsrael);
     const momentum = calculateMomentumMultiplier(regionAlerts, nowMs);
     const trend = calculateTrend(regionEvents, nowMs);
 
-    // P = baseRate × hourMultiplier × momentumMultiplier
-    let rawScore = baseRate * hourMult * momentum;
+    // P = baseRate × softenedHourMult × softenedMomentum
+    // softenMultiplier() prevents sub-1 values from compounding too aggressively
+    let rawScore = baseRate * softenMultiplier(hourMult) * softenMultiplier(momentum);
 
     // Override O2: Cap at 95 (no active alert)
     rawScore = Math.min(95, rawScore);
@@ -332,7 +365,9 @@ async function calculateAll() {
     // Detailed log
     console.log(
       `  ${region.padEnd(16)} ${String(score).padStart(3)}% | ` +
-      `base=${baseRate.toFixed(2)}% hour×${hourMult.toFixed(2)} mom×${momentum.toFixed(1)} | ` +
+      `hist=${historicalRate.toFixed(2)}% recent=${recentRate.toFixed(2)}% → base=${baseRate.toFixed(2)}% ` +
+      `hour×${hourMult.toFixed(2)}(→${softenMultiplier(hourMult).toFixed(2)}) ` +
+      `mom×${momentum.toFixed(1)}(→${softenMultiplier(momentum).toFixed(2)}) | ` +
       `24h:${eventsLast24h} 7d:${eventsLast7d} events:${regionEvents.length} (from ${regionAlerts.length} city alerts) | ` +
       `trend:${trend}`,
     );
@@ -342,7 +377,7 @@ async function calculateAll() {
   const { error: insertErr } = await db.from('probability_snapshots').insert(snapshots);
   if (insertErr) { console.error('Insert error:', insertErr.message); process.exit(1); }
 
-  console.log(`\nInserted ${snapshots.length} snapshots (Empirical v5 — event-based)`);
+  console.log(`\nInserted ${snapshots.length} snapshots (Empirical v5.1 — max-base + softened multipliers)`);
 
   // ── Summary ──
   const highProb = snapshots.filter(s => s.probability_score >= 50);
